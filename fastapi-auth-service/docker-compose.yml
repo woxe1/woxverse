@@ -1,0 +1,11 @@
+services:
+  auth-service:
+    build: .
+    container_name: fastapi-auth-service
+    ports:
+      - "8000:8000"
+    environment:
+      AUTH_LOGIN: admin@mail.ru
+      AUTH_PASSWORD: password123
+      CORS_ORIGINS: http://localhost:5173
+    restart: unless-stopped
