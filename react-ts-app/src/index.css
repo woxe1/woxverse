@@ -6,6 +6,10 @@
   --surface: #111722;
   --border: #273142;
   --input-bg: #0b111a;
+  --grid-line: rgba(255, 255, 255, 0.045);
+  --edge: #516079;
+  --node: #15243c;
+  --node-selected: #1f3762;
   --accent: #5b8cff;
   --accent-strong: #6d5dfc;
   --accent-soft: #24d3ee;

@@ -6,6 +6,10 @@ services:
       - "8000:8000"
     environment:
       AUTH_LOGIN: admin@mail.ru
-      AUTH_PASSWORD: password123
+      AUTH_PASSWORD: 123
       CORS_ORIGINS: http://localhost:5173
+      SQLITE_PATH: /data/graphs.sqlite
+      DOCUMENTS_PATH: /data/documents
+    volumes:
+      - ./data:/data
     restart: unless-stopped

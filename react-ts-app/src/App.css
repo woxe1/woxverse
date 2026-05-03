@@ -6,8 +6,16 @@
   box-sizing: border-box;
 }
 
+.workspace-shell {
+  min-height: 100svh;
+  display: grid;
+  padding: 0;
+  box-sizing: border-box;
+}
+
 .auth-panel,
-.dashboard-panel {
+.dashboard-panel,
+.workspace-panel {
   width: min(100%, 360px);
   padding: 30px;
   border: 1px solid var(--border);
@@ -20,12 +28,25 @@
 }
 
 .auth-panel::before,
-.dashboard-panel::before {
+.dashboard-panel::before,
+.workspace-panel::before {
   content: '';
   position: absolute;
   inset: 0 0 auto;
   height: 2px;
   background: linear-gradient(90deg, var(--accent), var(--accent-soft));
+}
+
+.workspace-panel {
+  width: 100%;
+  min-height: 100svh;
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  gap: 10px;
+  justify-self: center;
+  border: 0;
+  border-radius: 0;
+  padding: 14px;
 }
 
 .auth-header {
@@ -41,6 +62,44 @@
   display: flex;
   align-items: center;
   gap: 10px;
+}
+
+.workspace-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.workspace-header h1 {
+  font-size: 22px;
+}
+
+.mode-tabs {
+  display: inline-flex;
+  align-items: center;
+  align-self: start;
+  width: fit-content;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+}
+
+.mode-tabs button {
+  align-self: center;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+}
+
+.mode-tabs button.active {
+  background: var(--surface);
+  color: var(--text-h);
 }
 
 .status-dot {
@@ -106,6 +165,330 @@
   font-size: 14px;
   font-weight: 650;
   overflow-wrap: anywhere;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  align-self: start;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.workspace-panel button {
+  align-self: center;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 9px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1;
+}
+
+.toolbar button,
+.small-button {
+  align-self: center;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.toolbar button {
+  border: 1px solid var(--border);
+  background: var(--input-bg);
+  color: var(--text-h);
+}
+
+.toolbar button:hover {
+  border-color: var(--accent);
+  filter: none;
+}
+
+.graph-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  position: relative;
+  min-height: 0;
+}
+
+.graph-canvas {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background:
+    linear-gradient(var(--grid-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-line) 1px, transparent 1px),
+    var(--input-bg);
+  background-size: 32px 32px;
+  touch-action: none;
+}
+
+.graph-canvas.panning {
+  cursor: grabbing;
+}
+
+.graph-edge-group {
+  cursor: pointer;
+}
+
+.graph-edge {
+  stroke: var(--edge);
+  stroke-width: 2;
+}
+
+.graph-edge-hit {
+  stroke: transparent;
+  stroke-width: 18;
+}
+
+.graph-edge-group.selected .graph-edge {
+  stroke: var(--accent-soft);
+  stroke-width: 3;
+}
+
+.edge-label {
+  fill: var(--text-h);
+  stroke: var(--input-bg);
+  stroke-width: 4;
+  font-size: 12px;
+  font-weight: 720;
+  paint-order: stroke;
+  pointer-events: none;
+  text-anchor: middle;
+  user-select: none;
+}
+
+.graph-node circle {
+  fill: var(--node);
+  stroke: var(--accent);
+  stroke-width: 2;
+  cursor: grab;
+  transition:
+    fill 0.2s,
+    stroke-width 0.2s;
+}
+
+.graph-node.selected circle {
+  fill: var(--node-selected);
+  stroke: var(--accent-soft);
+  stroke-width: 3;
+}
+
+.graph-node text {
+  fill: var(--text-h);
+  font-size: 12px;
+  font-weight: 720;
+  pointer-events: none;
+  text-anchor: middle;
+  user-select: none;
+}
+
+.graph-node .node-doc-badge {
+  fill: var(--accent-soft);
+  font-size: 11px;
+  letter-spacing: 0;
+}
+
+.properties-panel {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: min(280px, calc(100% - 32px));
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+  box-shadow: var(--shadow);
+  z-index: 2;
+}
+
+.properties-panel h2 {
+  margin: 0;
+  color: var(--text-h);
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.properties-panel label {
+  display: grid;
+  gap: 8px;
+  color: var(--text-h);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.properties-panel input,
+.properties-panel select {
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-h);
+  font: inherit;
+  outline: none;
+}
+
+.properties-panel select {
+  width: 100%;
+}
+
+.properties-panel input:focus,
+.properties-panel select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
+.properties-panel p {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.docs-layout {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 16px;
+  min-height: 0;
+}
+
+.docs-sidebar,
+.doc-editor {
+  min-height: min(62svh, 620px);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+}
+
+.docs-sidebar {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  overflow: hidden;
+}
+
+.docs-sidebar h2,
+.empty-doc-state h2 {
+  margin: 0;
+  color: var(--text-h);
+  font-size: 18px;
+  line-height: 1.2;
+}
+
+.docs-sidebar h2 {
+  padding: 18px 18px 12px;
+}
+
+.doc-tree {
+  display: grid;
+  align-content: start;
+  gap: 4px;
+  padding: 0 10px 14px;
+  overflow: auto;
+}
+
+.doc-tree p,
+.empty-doc-state p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.doc-tree-item {
+  display: grid;
+  gap: 4px;
+}
+
+.doc-tree-button {
+  display: flex;
+  align-items: center;
+  min-height: 36px;
+  width: 100%;
+  justify-content: flex-start;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 650;
+  text-align: left;
+}
+
+.doc-tree-button:hover,
+.doc-tree-button.selected {
+  border-color: var(--border);
+  background: var(--surface);
+  color: var(--text-h);
+  filter: none;
+}
+
+.doc-editor {
+  display: grid;
+  align-content: start;
+  gap: 16px;
+  padding: 18px;
+}
+
+.doc-editor label {
+  display: grid;
+  gap: 8px;
+  color: var(--text-h);
+  font-size: 14px;
+  font-weight: 650;
+}
+
+.doc-editor input,
+.doc-editor textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text-h);
+  font: inherit;
+  outline: none;
+}
+
+.doc-editor input {
+  min-height: 44px;
+  padding: 0 12px;
+}
+
+.doc-editor textarea {
+  min-height: 420px;
+  padding: 12px;
+  resize: vertical;
+}
+
+.doc-editor input:focus,
+.doc-editor textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-bg);
+}
+
+.empty-doc-state {
+  display: grid;
+  gap: 8px;
+}
+
+.graph-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.success-text {
+  color: var(--success);
+}
+
+.danger-text {
+  color: var(--danger);
 }
 
 .login-form {
@@ -227,5 +610,45 @@ button:active {
 @media (max-width: 520px) {
   .auth-panel {
     padding: 24px;
+  }
+
+  .workspace-shell {
+    padding: 0;
+  }
+
+  .workspace-panel {
+    min-height: 100svh;
+    padding: 10px;
+  }
+
+  .workspace-header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .graph-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .docs-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .graph-canvas {
+    min-height: 360px;
+  }
+
+  .docs-sidebar,
+  .doc-editor {
+    min-height: 0;
+  }
+
+  .doc-editor textarea {
+    min-height: 300px;
+  }
+
+  .properties-panel {
+    inset: auto 12px 12px;
+    width: auto;
   }
 }
