@@ -2,7 +2,20 @@
 
 Minimal FastAPI service with hardcoded credentials provided through `docker-compose.yml`.
 Graphs are stored in local SQLite at `./data/graphs.sqlite`.
-Documentation structure is stored in SQLite, while every documentation page body is stored as a markdown file in `./data/documents/<document-name>/<section-id>.md`.
+Documentation is stored only on disk under `./data/documents/<document-name>/`.
+Chapters are folders, nested chapters are nested folders, and every page body is stored as `index.md`.
+
+Example:
+
+```text
+data/documents/default/
+  01-chapter-1--chapter-id/
+    index.md
+    01-subchapter--subchapter-id/
+      index.md
+      assets/
+        image.png
+```
 
 ## Run
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { FormEvent, MouseEvent, PointerEvent, WheelEvent } from 'react'
+import type { CSSProperties, FormEvent, MouseEvent, PointerEvent, WheelEvent } from 'react'
 import './App.css'
 
 type LoginState = 'idle' | 'loading' | 'success' | 'error'
@@ -47,10 +47,23 @@ type DocumentData = {
   sections: DocSection[]
 }
 
+type AssetUploadResponse = {
+  relative_path: string
+  url: string
+}
+
 type SectionOption = {
   id: string
   title: string
   depth: number
+}
+
+type DocBlockType = 'text' | 'heading' | 'image' | 'code' | 'quote'
+
+type DocBlock = {
+  id: string
+  type: DocBlockType
+  value: string
 }
 
 type Point = {
@@ -69,6 +82,10 @@ type PanDrag = {
 const apiUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 const graphName = 'default'
 const documentName = 'default'
+
+function createId(): string {
+  return crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
+}
 
 function findSection(sections: DocSection[], sectionId: string | null): DocSection | null {
   if (!sectionId) {
@@ -109,6 +126,99 @@ function getNodeRadius(label: string): number {
   return Math.max(30, Math.min(82, label.length * 4.2 + 16))
 }
 
+function parseMarkdownBlocks(content: string): DocBlock[] {
+  if (!content.trim()) {
+    return []
+  }
+
+  return content
+    .split(/\n{2,}/)
+    .map((block): DocBlock => {
+      const trimmedBlock = block.trim()
+      const imageMatch = trimmedBlock.match(/^!\[[^\]]*]\((.*)\)$/)
+
+      if (imageMatch) {
+        return { id: createId(), type: 'image', value: imageMatch[1] }
+      }
+
+      if (trimmedBlock.startsWith('```') && trimmedBlock.endsWith('```')) {
+        return {
+          id: createId(),
+          type: 'code',
+          value: trimmedBlock.replace(/^```\w*\n?/, '').replace(/\n?```$/, ''),
+        }
+      }
+
+      if (trimmedBlock.startsWith('# ')) {
+        return { id: createId(), type: 'heading', value: trimmedBlock.replace(/^# /, '') }
+      }
+
+      if (trimmedBlock.startsWith('> ')) {
+        return {
+          id: createId(),
+          type: 'quote',
+          value: trimmedBlock
+            .split('\n')
+            .map((line) => line.replace(/^> ?/, ''))
+            .join('\n'),
+        }
+      }
+
+      return { id: createId(), type: 'text', value: trimmedBlock }
+    })
+}
+
+function serializeMarkdownBlocks(blocks: DocBlock[]): string {
+  return blocks
+    .map((block) => {
+      if (block.type === 'heading') {
+        return `# ${block.value}`
+      }
+
+      if (block.type === 'image') {
+        return block.value ? `![Image](${block.value})` : ''
+      }
+
+      if (block.type === 'code') {
+        return `\`\`\`\n${block.value}\n\`\`\``
+      }
+
+      if (block.type === 'quote') {
+        return block.value
+          .split('\n')
+          .map((line) => `> ${line}`)
+          .join('\n')
+      }
+
+      return block.value
+    })
+    .filter(Boolean)
+    .join('\n\n')
+}
+
+function getImagePreviewUrl(documentName: string, sectionId: string | null, value: string): string {
+  if (!sectionId || !value) {
+    return ''
+  }
+
+  if (/^https?:\/\//.test(value) || value.startsWith('data:')) {
+    return value
+  }
+
+  const filename = value.replace(/^assets\//, '')
+  return `${apiUrl}/documents/${documentName}/sections/${sectionId}/assets/${encodeURIComponent(filename)}`
+}
+
+function buildBlocksBySectionId(sections: DocSection[]): Record<string, DocBlock[]> {
+  return sections.reduce<Record<string, DocBlock[]>>((blocksBySectionId, section) => {
+    return {
+      ...blocksBySectionId,
+      [section.id]: parseMarkdownBlocks(section.content),
+      ...buildBlocksBySectionId(section.children),
+    }
+  }, {})
+}
+
 function updateSectionTree(
   sections: DocSection[],
   sectionId: string,
@@ -128,6 +238,7 @@ function updateSectionTree(
 
 function App() {
   const canvasRef = useRef<SVGSVGElement | null>(null)
+  const imageInputRef = useRef<HTMLInputElement | null>(null)
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>('graph')
   const [loginState, setLoginState] = useState<LoginState>('idle')
   const [saveState, setSaveState] = useState<SaveState>('idle')
@@ -146,6 +257,7 @@ function App() {
   const [panDrag, setPanDrag] = useState<PanDrag | null>(null)
   const [sections, setSections] = useState<DocSection[]>([])
   const [selectedSectionId, setSelectedSectionId] = useState<string | null>(null)
+  const [docBlocksBySectionId, setDocBlocksBySectionId] = useState<Record<string, DocBlock[]>>({})
 
   const selectedNodes = useMemo(
     () => nodes.filter((node) => selectedNodeIds.includes(node.id)),
@@ -155,6 +267,7 @@ function App() {
   const selectedEdge = edges.find((edge) => edge.id === selectedEdgeId) ?? null
   const selectedSection = findSection(sections, selectedSectionId)
   const sectionOptions = useMemo(() => flattenSections(sections), [sections])
+  const selectedSectionBlocks = selectedSectionId ? docBlocksBySectionId[selectedSectionId] ?? [] : []
   const linkedSection = selectedNode
     ? findSection(sections, selectedNode.document_section_id ?? null)
     : null
@@ -199,6 +312,7 @@ function App() {
 
         const document = (await response.json()) as DocumentData
         setSections(document.sections)
+        setDocBlocksBySectionId(buildBlocksBySectionId(document.sections))
         setSelectedSectionId(document.sections[0]?.id ?? null)
         setDocMessage('Documentation loaded')
       } catch {
@@ -284,6 +398,7 @@ function App() {
     setSelectedNodeIds([])
     setSelectedEdgeId(null)
     setSelectedSectionId(null)
+    setDocBlocksBySectionId({})
   }
 
   function getCanvasPoint(event: MouseEvent<SVGSVGElement> | PointerEvent<SVGSVGElement>) {
@@ -510,16 +625,16 @@ function App() {
     }
 
     setSelectedSectionId(section.id)
+    setDocBlocksBySectionId((currentBlocks) => ({
+      ...currentBlocks,
+      [section.id]: [],
+    }))
     setDocMessage(parentId ? 'Subchapter created' : 'Chapter created')
   }
 
-  function updateSelectedSectionTitle(title: string) {
-    if (!selectedSectionId) {
-      return
-    }
-
+  function updateSectionTitle(sectionId: string, title: string) {
     setSections((currentSections) =>
-      updateSectionTree(currentSections, selectedSectionId, (section) => ({ ...section, title })),
+      updateSectionTree(currentSections, sectionId, (section) => ({ ...section, title })),
     )
   }
 
@@ -533,9 +648,88 @@ function App() {
     )
   }
 
-  async function saveDocument() {
-    if (!session) {
+  function updateSelectedSectionBlocks(blocks: DocBlock[]) {
+    if (!selectedSectionId) {
       return
+    }
+
+    setDocBlocksBySectionId((currentBlocks) => ({
+      ...currentBlocks,
+      [selectedSectionId]: blocks,
+    }))
+    updateSelectedSectionContent(serializeMarkdownBlocks(blocks))
+  }
+
+  function addContentBlock(type: DocBlockType, value?: string) {
+    const initialValueByType: Record<DocBlockType, string> = {
+      text: '',
+      heading: 'Heading',
+      image: '',
+      code: '',
+      quote: '',
+    }
+
+    updateSelectedSectionBlocks([
+      ...selectedSectionBlocks,
+      {
+        id: createId(),
+        type,
+        value: value ?? initialValueByType[type],
+      },
+    ])
+  }
+
+  async function handleNewImageFile(file: File) {
+    if (!selectedSectionId) {
+      return
+    }
+
+    const blockId = createId()
+    const nextBlocks: DocBlock[] = [
+      ...selectedSectionBlocks,
+      {
+        id: blockId,
+        type: 'image',
+        value: '',
+      },
+    ]
+
+    updateSelectedSectionBlocks(nextBlocks)
+    await uploadImageBlock(blockId, file, nextBlocks)
+  }
+
+  function updateContentBlock(blockId: string, value: string) {
+    if (!selectedSectionId) {
+      return
+    }
+
+    setDocBlocksBySectionId((currentBlocks) => {
+      const currentSectionBlocks = currentBlocks[selectedSectionId] ?? []
+      const nextBlocks = currentSectionBlocks.map((block) =>
+        block.id === blockId ? { ...block, value } : block,
+      )
+
+      setSections((currentSections) =>
+        updateSectionTree(currentSections, selectedSectionId, (section) => ({
+          ...section,
+          content: serializeMarkdownBlocks(nextBlocks),
+        })),
+      )
+
+      return {
+        ...currentBlocks,
+        [selectedSectionId]: nextBlocks,
+      }
+    })
+  }
+
+  function removeContentBlock(blockId: string) {
+    updateSelectedSectionBlocks(selectedSectionBlocks.filter((block) => block.id !== blockId))
+  }
+
+  async function saveDocument(sectionsToSave = sections) {
+    if (!session) {
+      return false
     }
 
     setDocSaveState('loading')
@@ -548,7 +742,7 @@ function App() {
           Authorization: `Bearer ${session.token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ sections }),
+        body: JSON.stringify({ sections: sectionsToSave }),
       })
 
       if (!response.ok) {
@@ -557,9 +751,61 @@ function App() {
 
       setDocSaveState('success')
       setDocMessage('Documentation saved')
+      return true
     } catch {
       setDocSaveState('error')
       setDocMessage('Save failed')
+      return false
+    }
+  }
+
+  async function uploadImageBlock(blockId: string, file: File, blocksOverride?: DocBlock[]) {
+    if (!session || !selectedSectionId) {
+      return
+    }
+
+    setDocMessage('Saving before upload...')
+    const blocksToSave = blocksOverride ?? selectedSectionBlocks
+    const sectionsToSave = sections.map((section) =>
+      selectedSectionId
+        ? updateSectionTree([section], selectedSectionId, (currentSection) => ({
+            ...currentSection,
+            content: serializeMarkdownBlocks(blocksToSave),
+          }))[0]
+        : section,
+    )
+
+    const saved = await saveDocument(sectionsToSave)
+
+    if (!saved) {
+      return
+    }
+
+    const formData = new FormData()
+    formData.append('file', file)
+
+    try {
+      const response = await fetch(
+        `${apiUrl}/documents/${documentName}/sections/${selectedSectionId}/assets`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${session.token}`,
+          },
+          body: formData,
+        },
+      )
+
+      if (!response.ok) {
+        throw new Error('Unable to upload image')
+      }
+
+      const upload = (await response.json()) as AssetUploadResponse
+      updateContentBlock(blockId, upload.relative_path)
+      setDocMessage('Image uploaded')
+    } catch {
+      setDocSaveState('error')
+      setDocMessage('Image upload failed')
     }
   }
 
@@ -604,14 +850,20 @@ function App() {
   function renderSectionTree(sectionList: DocSection[], level = 0) {
     return sectionList.map((section) => (
       <div key={section.id} className="doc-tree-item">
-        <button
-          className={selectedSectionId === section.id ? 'doc-tree-button selected' : 'doc-tree-button'}
-          style={{ paddingLeft: `${12 + level * 18}px` }}
-          type="button"
+        <div
+          className={selectedSectionId === section.id ? 'doc-tree-row selected' : 'doc-tree-row'}
+          style={{ '--section-depth': level } as CSSProperties}
           onClick={() => setSelectedSectionId(section.id)}
         >
-          {section.title || 'Untitled'}
-        </button>
+          <input
+            className="doc-tree-input"
+            value={section.title}
+            aria-label="Chapter title"
+            placeholder="Untitled"
+            onChange={(event) => updateSectionTitle(section.id, event.target.value)}
+            onFocus={() => setSelectedSectionId(section.id)}
+          />
+        </div>
         {section.children.length > 0 && renderSectionTree(section.children, level + 1)}
       </div>
     ))
@@ -836,7 +1088,7 @@ function App() {
                 >
                   Add subchapter
                 </button>
-                <button className="secondary-button" type="button" onClick={saveDocument}>
+                <button className="secondary-button" type="button" onClick={() => saveDocument()}>
                   {docSaveState === 'loading' ? 'Saving...' : 'Save'}
                 </button>
               </div>
@@ -852,23 +1104,109 @@ function App() {
                 <section className="doc-editor" aria-label="Documentation editor">
                   {selectedSection ? (
                     <>
-                      <label htmlFor="section-title">
-                        Title
-                        <input
-                          id="section-title"
-                          type="text"
-                          value={selectedSection.title}
-                          onChange={(event) => updateSelectedSectionTitle(event.target.value)}
-                        />
-                      </label>
-                      <label htmlFor="section-content">
-                        Content
-                        <textarea
-                          id="section-content"
-                          value={selectedSection.content}
-                          onChange={(event) => updateSelectedSectionContent(event.target.value)}
-                        />
-                      </label>
+                      <div className="doc-editor-header">
+                        <div>
+                          <p className="profile-label">Editing</p>
+                          <h2>{selectedSection.title || 'Untitled'}</h2>
+                        </div>
+                        <div className="block-toolbar" aria-label="Add content block">
+                          <span>+</span>
+                          <button type="button" onClick={() => addContentBlock('text')}>
+                            Text
+                          </button>
+                          <button type="button" onClick={() => addContentBlock('heading')}>
+                            Heading
+                          </button>
+                          <button type="button" onClick={() => imageInputRef.current?.click()}>
+                            Image
+                          </button>
+                          <input
+                            ref={imageInputRef}
+                            type="file"
+                            accept="image/*"
+                            hidden
+                            onChange={(event) => {
+                              const file = event.target.files?.[0]
+
+                              if (file) {
+                                handleNewImageFile(file)
+                              }
+
+                              event.target.value = ''
+                            }}
+                          />
+                          <button type="button" onClick={() => addContentBlock('code')}>
+                            Code
+                          </button>
+                          <button type="button" onClick={() => addContentBlock('quote')}>
+                            Quote
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="content-blocks">
+                        {selectedSectionBlocks.length > 0 ? (
+                          selectedSectionBlocks.map((block) => (
+                            <div className="content-block" key={block.id}>
+                              <div className="content-block-header">
+                                <button
+                                  className="secondary-button"
+                                  type="button"
+                                  onClick={() => removeContentBlock(block.id)}
+                                >
+                                  Remove
+                                </button>
+                              </div>
+
+                              {block.type === 'heading' && (
+                                <input
+                                  type="text"
+                                  value={block.value}
+                                  placeholder="Heading"
+                                  onChange={(event) => updateContentBlock(block.id, event.target.value)}
+                                />
+                              )}
+
+                              {block.type === 'image' && (
+                                <div className="image-block-editor">
+                                  <input
+                                    type="text"
+                                    value={block.value}
+                                    placeholder="assets/image.png"
+                                    onChange={(event) => updateContentBlock(block.id, event.target.value)}
+                                  />
+                                  {block.value && (
+                                    <img
+                                      className="image-preview"
+                                      src={getImagePreviewUrl(documentName, selectedSectionId, block.value)}
+                                      alt=""
+                                    />
+                                  )}
+                                </div>
+                              )}
+
+                              {(block.type === 'text' || block.type === 'quote' || block.type === 'code') && (
+                                <textarea
+                                  value={block.value}
+                                  placeholder={
+                                    block.type === 'code'
+                                      ? 'Code'
+                                      : block.type === 'quote'
+                                        ? 'Quote'
+                                        : 'Text'
+                                  }
+                                  onChange={(event) => updateContentBlock(block.id, event.target.value)}
+                                />
+                              )}
+                            </div>
+                          ))
+                        ) : (
+                          <div className="empty-doc-state">
+                            <h2>No blocks yet</h2>
+                            <p>Use the plus controls to add content.</p>
+                          </div>
+                        )}
+                      </div>
                     </>
                   ) : (
                     <div className="empty-doc-state">

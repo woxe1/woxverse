@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
+import shutil
 import sqlite3
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 
@@ -66,6 +69,11 @@ class LoginResponse(BaseModel):
     token: str
 
 
+class AssetUploadResponse(BaseModel):
+    relative_path: str
+    url: str
+
+
 def get_connection() -> sqlite3.Connection:
     database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database_path)
@@ -84,15 +92,6 @@ def init_database() -> None:
             )
             """
         )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS documents (
-                name TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
 
 
 def get_document_directory(document_name: str) -> Path:
@@ -101,57 +100,120 @@ def get_document_directory(document_name: str) -> Path:
     return document_directory
 
 
-def get_section_file(document_name: str, section_id: str) -> Path:
-    return get_document_directory(document_name) / f"{section_id}.md"
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9а-яА-ЯёЁ]+", "-", value.strip().lower())
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return slug or "section"
 
 
-def strip_section_content(sections: list[DocSection]) -> list[dict[str, Any]]:
-    return [
-        {
-            "id": section.id,
-            "title": section.title,
-            "children": strip_section_content(section.children),
-        }
-        for section in sections
-    ]
+def get_section_directory(parent_directory: Path, section: DocSection, index: int) -> Path:
+    return parent_directory / f"{index:02d}-{slugify(section.title)}--{section.id}"
 
 
-def write_markdown_files(document_name: str, sections: list[DocSection]) -> set[str]:
-    written_section_ids: set[str] = set()
-
-    for section in sections:
-        section_file = get_section_file(document_name, section.id)
-        section_file.write_text(section.content, encoding="utf-8")
-        written_section_ids.add(section.id)
-        written_section_ids.update(write_markdown_files(document_name, section.children))
-
-    return written_section_ids
+def find_section_directory(parent_directory: Path, section_id: str) -> Path | None:
+    matches = sorted(parent_directory.glob(f"*--{section_id}"))
+    return matches[0] if matches else None
 
 
-def remove_stale_markdown_files(document_name: str, active_section_ids: set[str]) -> None:
+def find_section_directory_recursive(document_name: str, section_id: str) -> Path | None:
     document_directory = get_document_directory(document_name)
-
-    for section_file in document_directory.glob("*.md"):
-        if section_file.stem not in active_section_ids:
-            section_file.unlink()
+    matches = sorted(document_directory.rglob(f"*--{section_id}"))
+    return matches[0] if matches else None
 
 
-def hydrate_section_content(document_name: str, sections: list[DocSection]) -> list[DocSection]:
-    hydrated_sections: list[DocSection] = []
+def sanitize_filename(filename: str) -> str:
+    path = Path(filename)
+    stem = slugify(path.stem)
+    suffix = re.sub(r"[^a-zA-Z0-9.]", "", path.suffix.lower()) or ".bin"
+    return f"{stem}{suffix}"
 
-    for section in sections:
-        section_file = get_section_file(document_name, section.id)
-        content = section_file.read_text(encoding="utf-8") if section_file.exists() else section.content
-        hydrated_sections.append(
+
+def parse_section_directory_name(directory: Path) -> tuple[int, str, str]:
+    match = re.match(r"^(\d+)-(.+)--(.+)$", directory.name)
+
+    if not match:
+        return (9999, directory.name.replace("-", " "), directory.name)
+
+    order = int(match.group(1))
+    title = match.group(2).replace("-", " ")
+    section_id = match.group(3)
+    return (order, title, section_id)
+
+
+def scan_document_sections(parent_directory: Path) -> list[DocSection]:
+    sections: list[DocSection] = []
+
+    for section_directory in sorted(
+        [path for path in parent_directory.iterdir() if path.is_dir() and path.name != "assets"],
+        key=lambda path: parse_section_directory_name(path)[0],
+    ):
+        _, title, section_id = parse_section_directory_name(section_directory)
+        section_file = section_directory / "index.md"
+        sections.append(
             DocSection(
-                id=section.id,
-                title=section.title,
-                content=content,
-                children=hydrate_section_content(document_name, section.children),
+                id=section_id,
+                title=title,
+                content=section_file.read_text(encoding="utf-8") if section_file.exists() else "",
+                children=scan_document_sections(section_directory),
             )
         )
 
-    return hydrated_sections
+    for markdown_file in sorted(parent_directory.glob("*.md")):
+        if markdown_file.name == "index.md":
+            continue
+
+        section_id = markdown_file.stem
+        if any(section.id == section_id for section in sections):
+            continue
+
+        sections.append(
+            DocSection(
+                id=section_id,
+                title=section_id.replace("-", " "),
+                content=markdown_file.read_text(encoding="utf-8"),
+                children=[],
+            )
+        )
+
+    return sections
+
+
+def write_markdown_files(
+    document_name: str,
+    sections: list[DocSection],
+    parent_directory: Path | None = None,
+) -> set[Path]:
+    document_directory = get_document_directory(document_name)
+    current_directory = parent_directory or document_directory
+    active_paths: set[Path] = set()
+
+    for index, section in enumerate(sections, start=1):
+        previous_directory = find_section_directory(current_directory, section.id)
+        section_directory = get_section_directory(current_directory, section, index)
+
+        if previous_directory and previous_directory != section_directory:
+            previous_directory.rename(section_directory)
+
+        section_directory.mkdir(parents=True, exist_ok=True)
+        section_file = section_directory / "index.md"
+        section_file.write_text(section.content, encoding="utf-8")
+        active_paths.add(section_directory)
+        active_paths.add(section_file)
+        active_paths.update(write_markdown_files(document_name, section.children, section_directory))
+
+    return active_paths
+
+
+def remove_stale_markdown_files(document_name: str, active_paths: set[Path]) -> None:
+    document_directory = get_document_directory(document_name)
+
+    for markdown_file in sorted(document_directory.rglob("*.md"), reverse=True):
+        if markdown_file not in active_paths:
+            markdown_file.unlink()
+
+    for directory in sorted(document_directory.rglob("*"), key=lambda path: len(path.parts), reverse=True):
+        if directory.is_dir() and directory not in active_paths and not any(directory.iterdir()):
+            directory.rmdir()
 
 
 def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
@@ -234,19 +296,7 @@ def save_graph(graph_name: str, graph: GraphData) -> GraphData:
     dependencies=[Depends(require_token)],
 )
 def get_document(document_name: str) -> DocumentData:
-    with get_connection() as connection:
-        row = connection.execute(
-            "SELECT data FROM documents WHERE name = ?",
-            (document_name,),
-        ).fetchone()
-
-    if row is None:
-        return DocumentData(sections=[])
-
-    document = DocumentData.model_validate_json(row["data"])
-    return DocumentData(
-        sections=hydrate_section_content(document_name, document.sections),
-    )
+    return DocumentData(sections=scan_document_sections(get_document_directory(document_name)))
 
 
 @app.put(
@@ -255,22 +305,58 @@ def get_document(document_name: str) -> DocumentData:
     dependencies=[Depends(require_token)],
 )
 def save_document(document_name: str, document: DocumentData) -> DocumentData:
-    active_section_ids = write_markdown_files(document_name, document.sections)
-    remove_stale_markdown_files(document_name, active_section_ids)
-    document_tree = {
-        "sections": strip_section_content(document.sections),
-    }
+    active_paths = write_markdown_files(document_name, document.sections)
+    remove_stale_markdown_files(document_name, active_paths)
+    return document
 
-    with get_connection() as connection:
-        connection.execute(
-            """
-            INSERT INTO documents (name, data, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(name) DO UPDATE SET
-                data = excluded.data,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (document_name, DocumentData.model_validate(document_tree).model_dump_json()),
+
+@app.post(
+    "/documents/{document_name}/sections/{section_id}/assets",
+    response_model=AssetUploadResponse,
+    dependencies=[Depends(require_token)],
+)
+def upload_document_asset(
+    document_name: str,
+    section_id: str,
+    file: Annotated[UploadFile, File()],
+) -> AssetUploadResponse:
+    section_directory = find_section_directory_recursive(document_name, section_id)
+
+    if section_directory is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Section directory not found. Save the document before uploading assets.",
         )
 
-    return document
+    safe_filename = sanitize_filename(file.filename or "image")
+    assets_directory = section_directory / "assets"
+    assets_directory.mkdir(parents=True, exist_ok=True)
+    destination = assets_directory / safe_filename
+
+    counter = 1
+    while destination.exists():
+        destination = assets_directory / f"{Path(safe_filename).stem}-{counter}{Path(safe_filename).suffix}"
+        counter += 1
+
+    with destination.open("wb") as output:
+        shutil.copyfileobj(file.file, output)
+
+    return AssetUploadResponse(
+        relative_path=f"assets/{destination.name}",
+        url=f"/documents/{document_name}/sections/{section_id}/assets/{destination.name}",
+    )
+
+
+@app.get("/documents/{document_name}/sections/{section_id}/assets/{filename}")
+def get_document_asset(document_name: str, section_id: str, filename: str) -> FileResponse:
+    section_directory = find_section_directory_recursive(document_name, section_id)
+
+    if section_directory is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Section not found")
+
+    asset_path = section_directory / "assets" / sanitize_filename(filename)
+
+    if not asset_path.exists() or not asset_path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
+
+    return FileResponse(asset_path)
