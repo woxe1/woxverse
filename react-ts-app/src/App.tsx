@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { FitAddon } from '@xterm/addon-fit'
 import type {
   CSSProperties,
   ChangeEvent,
@@ -8,7 +9,9 @@ import type {
   PointerEvent,
   WheelEvent,
 } from 'react'
+import { Terminal } from 'xterm'
 import './App.css'
+import 'xterm/css/xterm.css'
 
 type LoginState = 'idle' | 'loading' | 'success' | 'error'
 type SaveState = 'idle' | 'loading' | 'success' | 'error'
@@ -66,7 +69,7 @@ type SectionOption = {
   depth: number
 }
 
-type DocBlockType = 'text' | 'heading' | 'image' | 'code' | 'quote'
+type DocBlockType = 'text' | 'heading' | 'image' | 'code' | 'quote' | 'playground' | 'terminal'
 type TextFont = 'default' | 'serif' | 'mono' | 'display'
 
 type DocBlock = {
@@ -80,6 +83,28 @@ type SlashCommand = {
   type: DocBlockType
   label: string
   hint: string
+}
+
+type PlaygroundRunResponse = {
+  success: boolean
+  exit_code: number
+  stdout: string
+  stderr: string
+}
+
+type TerminalBlockConfig = {
+  connectionString: string
+  host: string
+  port: string
+  username: string
+  password: string
+}
+
+type TerminalOpenResponse = {
+  session_id: string
+  host: string
+  port: number
+  username: string
 }
 
 type Point = {
@@ -110,6 +135,8 @@ const slashCommands: SlashCommand[] = [
   { type: 'heading', label: 'H1', hint: 'Large section heading' },
   { type: 'image', label: 'Image', hint: 'Upload and insert a photo' },
   { type: 'code', label: 'Code', hint: 'Highlighted code block' },
+  { type: 'playground', label: 'Playground', hint: 'Run Python code inline' },
+  { type: 'terminal', label: 'Terminal', hint: 'Open an SSH terminal' },
   { type: 'quote', label: 'Quote', hint: 'Callout quote text' },
 ]
 
@@ -152,8 +179,72 @@ function flattenSections(sections: DocSection[], depth = 0): SectionOption[] {
   ])
 }
 
+function filterSectionsByQuery(sections: DocSection[], query: string): DocSection[] {
+  const normalizedQuery = query.trim().toLowerCase()
+
+  if (!normalizedQuery) {
+    return sections
+  }
+
+  return sections.reduce<DocSection[]>((matches, section) => {
+    const matchingChildren = filterSectionsByQuery(section.children, normalizedQuery)
+    const haystack = `${section.title}\n${section.content}`.toLowerCase()
+
+    if (haystack.includes(normalizedQuery) || matchingChildren.length > 0) {
+      matches.push({
+        ...section,
+        children: matchingChildren,
+      })
+    }
+
+    return matches
+  }, [])
+}
+
 function getNodeRadius(label: string): number {
   return Math.max(30, Math.min(82, label.length * 4.2 + 16))
+}
+
+function createDefaultTerminalConfig(): TerminalBlockConfig {
+  return {
+    connectionString: '',
+    host: '',
+    port: '22',
+    username: '',
+    password: '',
+  }
+}
+
+function parseTerminalBlockConfig(value: string): TerminalBlockConfig {
+  if (!value.trim()) {
+    return createDefaultTerminalConfig()
+  }
+
+  try {
+    const parsed = JSON.parse(value) as Partial<TerminalBlockConfig>
+
+    return {
+      connectionString: parsed.connectionString ?? '',
+      host: parsed.host ?? '',
+      port: parsed.port ?? '22',
+      username: parsed.username ?? '',
+      password: parsed.password ?? '',
+    }
+  } catch {
+    return createDefaultTerminalConfig()
+  }
+}
+
+function stringifyTerminalBlockConfig(config: TerminalBlockConfig): string {
+  return JSON.stringify(config, null, 2)
+}
+
+function getTerminalWebSocketUrl(apiBaseUrl: string, sessionId: string, token: string): string {
+  const url = new URL(apiBaseUrl)
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+  url.pathname = `/terminal/sessions/${sessionId}/ws`
+  url.searchParams.set('token', token)
+  return url.toString()
 }
 
 function resizeTextarea(textarea: HTMLTextAreaElement) {
@@ -257,6 +348,22 @@ function parseMarkdownBlocks(content: string): DocBlock[] {
       }
 
       if (trimmedBlock.startsWith('```') && trimmedBlock.endsWith('```')) {
+        if (trimmedBlock.startsWith('```terminal')) {
+          return {
+            id: createId(),
+            type: 'terminal',
+            value: trimmedBlock.replace(/^```terminal\s*\n?/, '').replace(/\n?```$/, ''),
+          }
+        }
+
+        if (trimmedBlock.startsWith('```playground')) {
+          return {
+            id: createId(),
+            type: 'playground',
+            value: trimmedBlock.replace(/^```playground\s*\n?/, '').replace(/\n?```$/, ''),
+          }
+        }
+
         return {
           id: createId(),
           type: 'code',
@@ -296,6 +403,14 @@ function serializeMarkdownBlocks(blocks: DocBlock[]): string {
 
       if (block.type === 'code') {
         return `\`\`\`\n${block.value}\n\`\`\``
+      }
+
+      if (block.type === 'playground') {
+        return `\`\`\`playground\n${block.value}\n\`\`\``
+      }
+
+      if (block.type === 'terminal') {
+        return `\`\`\`terminal\n${block.value}\n\`\`\``
       }
 
       if (block.type === 'quote') {
@@ -386,6 +501,46 @@ function updateSectionTree(
   })
 }
 
+function collectSectionIds(section: DocSection): string[] {
+  return [section.id, ...section.children.flatMap(collectSectionIds)]
+}
+
+function removeSectionFromTree(
+  sections: DocSection[],
+  sectionId: string,
+): { nextSections: DocSection[]; removedSection: DocSection | null } {
+  let removedSection: DocSection | null = null
+
+  const nextSections = sections
+    .filter((section) => {
+      if (section.id === sectionId) {
+        removedSection = section
+        return false
+      }
+
+      return true
+    })
+    .map((section) => {
+      if (removedSection) {
+        return section
+      }
+
+      const result = removeSectionFromTree(section.children, sectionId)
+
+      if (result.removedSection) {
+        removedSection = result.removedSection
+        return {
+          ...section,
+          children: result.nextSections,
+        }
+      }
+
+      return section
+    })
+
+  return { nextSections, removedSection }
+}
+
 function loadStoredSession(): UserSession | null {
   try {
     const storedSession = localStorage.getItem(sessionStorageKey)
@@ -404,6 +559,239 @@ function loadStoredSession(): UserSession | null {
     localStorage.removeItem(sessionStorageKey)
     return null
   }
+}
+
+type TerminalBlockProps = {
+  blockId: string
+  value: string
+  session: UserSession | null
+  onChange: (value: string) => void
+}
+
+function TerminalBlock({ blockId, value, session, onChange }: TerminalBlockProps) {
+  const config = useMemo(() => parseTerminalBlockConfig(value), [value])
+  const [connectionState, setConnectionState] = useState<'idle' | 'opening' | 'open'>('idle')
+  const [connectionMessage, setConnectionMessage] = useState('')
+  const [sessionId, setSessionId] = useState<string | null>(null)
+  const terminalContainerRef = useRef<HTMLDivElement | null>(null)
+  const terminalRef = useRef<Terminal | null>(null)
+  const fitAddonRef = useRef<FitAddon | null>(null)
+  const socketRef = useRef<WebSocket | null>(null)
+
+  useEffect(() => {
+    if (!terminalContainerRef.current || terminalRef.current) {
+      return
+    }
+
+    const terminal = new Terminal({
+      cursorBlink: true,
+      fontFamily:
+        "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace",
+      fontSize: 13,
+      lineHeight: 1.35,
+      theme: {
+        background: '#05070c',
+        foreground: '#d7e2f2',
+        cursor: '#24d3ee',
+        selectionBackground: 'rgba(36, 211, 238, 0.25)',
+      },
+    })
+    const fitAddon = new FitAddon()
+
+    terminal.loadAddon(fitAddon)
+    terminal.open(terminalContainerRef.current)
+    fitAddon.fit()
+    terminal.writeln('Terminal is ready. Fill connection details and press Open.')
+
+    terminal.onData((data) => {
+      if (socketRef.current?.readyState === WebSocket.OPEN) {
+        socketRef.current.send(data)
+      }
+    })
+
+    const handleResize = () => fitAddon.fit()
+    window.addEventListener('resize', handleResize)
+
+    terminalRef.current = terminal
+    fitAddonRef.current = fitAddon
+
+    return () => {
+      window.removeEventListener('resize', handleResize)
+      socketRef.current?.close()
+      terminal.dispose()
+      terminalRef.current = null
+      fitAddonRef.current = null
+    }
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (sessionId && session) {
+        fetch(`${apiUrl}/terminal/sessions/${sessionId}/close`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${session.token}`,
+          },
+        }).catch(() => undefined)
+      }
+    }
+  }, [session, sessionId])
+
+  function updateTerminalField(field: keyof TerminalBlockConfig, nextValue: string) {
+    onChange(
+      stringifyTerminalBlockConfig({
+        ...config,
+        [field]: nextValue,
+      }),
+    )
+  }
+
+  async function closeTerminal() {
+    socketRef.current?.close()
+    socketRef.current = null
+
+    if (sessionId && session) {
+      try {
+        await fetch(`${apiUrl}/terminal/sessions/${sessionId}/close`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${session.token}`,
+          },
+        })
+      } catch {
+        // keep local terminal state consistent even if close request fails
+      }
+    }
+
+    setSessionId(null)
+    setConnectionState('idle')
+    setConnectionMessage('')
+    terminalRef.current?.writeln('\r\n[session closed]')
+  }
+
+  async function openTerminal() {
+    if (!session) {
+      return
+    }
+
+    setConnectionState('opening')
+    setConnectionMessage('')
+
+    try {
+      const response = await fetch(`${apiUrl}/terminal/sessions/open`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${session.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          connection_string: config.connectionString,
+          host: config.host,
+          port: Number(config.port || '22'),
+          username: config.username,
+          password: config.password,
+        }),
+      })
+
+      if (!response.ok) {
+        const errorPayload = (await response.json().catch(() => null)) as { detail?: string } | null
+        throw new Error(errorPayload?.detail ?? 'Unable to open terminal')
+      }
+
+      const data = (await response.json()) as TerminalOpenResponse
+      const socket = new WebSocket(getTerminalWebSocketUrl(apiUrl, data.session_id, session.token))
+
+      socket.onopen = () => {
+        setSessionId(data.session_id)
+        setConnectionState('open')
+        setConnectionMessage(`${data.username}@${data.host}:${data.port}`)
+        terminalRef.current?.clear()
+        terminalRef.current?.writeln(`[connected to ${data.username}@${data.host}:${data.port}]`)
+        fitAddonRef.current?.fit()
+      }
+
+      socket.onmessage = (event) => {
+        terminalRef.current?.write(event.data)
+      }
+
+      socket.onclose = () => {
+        socketRef.current = null
+        setSessionId(null)
+        setConnectionState('idle')
+      }
+
+      socket.onerror = () => {
+        setConnectionState('idle')
+        setConnectionMessage('Terminal connection failed')
+      }
+
+      socketRef.current = socket
+    } catch (error) {
+      setConnectionState('idle')
+      setConnectionMessage(error instanceof Error ? error.message : 'Unable to open terminal')
+    }
+  }
+
+  return (
+    <div className="terminal-editor">
+      <div className="terminal-config-grid">
+        <input
+          data-block-id={blockId}
+          className="terminal-config-input terminal-connection-string"
+          type="text"
+          value={config.connectionString}
+          placeholder="ssh://user:password@host:22"
+          onChange={(event) => updateTerminalField('connectionString', event.target.value)}
+        />
+        <input
+          className="terminal-config-input"
+          type="text"
+          value={config.host}
+          placeholder="Host / IP"
+          onChange={(event) => updateTerminalField('host', event.target.value)}
+        />
+        <input
+          className="terminal-config-input"
+          type="text"
+          value={config.port}
+          placeholder="Port"
+          onChange={(event) => updateTerminalField('port', event.target.value)}
+        />
+        <input
+          className="terminal-config-input"
+          type="text"
+          value={config.username}
+          placeholder="Login"
+          onChange={(event) => updateTerminalField('username', event.target.value)}
+        />
+        <input
+          className="terminal-config-input"
+          type="password"
+          value={config.password}
+          placeholder="Password"
+          onChange={(event) => updateTerminalField('password', event.target.value)}
+        />
+      </div>
+
+      <div className="terminal-toolbar">
+        <span className="terminal-badge">SSH terminal</span>
+        <div className="terminal-toolbar-actions">
+          {connectionMessage ? <span className="terminal-connection-state">{connectionMessage}</span> : null}
+          {connectionState === 'open' ? (
+            <button className="terminal-close-button" type="button" onClick={closeTerminal}>
+              Close
+            </button>
+          ) : (
+            <button className="terminal-open-button" type="button" onClick={openTerminal}>
+              {connectionState === 'opening' ? 'Opening...' : 'Open'}
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="terminal-surface" ref={terminalContainerRef} />
+    </div>
+  )
 }
 
 function App() {
@@ -428,10 +816,14 @@ function App() {
   const [sections, setSections] = useState<DocSection[]>([])
   const [selectedSectionId, setSelectedSectionId] = useState<string | null>(null)
   const [editingSectionId, setEditingSectionId] = useState<string | null>(null)
+  const [sectionSearch, setSectionSearch] = useState('')
   const [docBlocksBySectionId, setDocBlocksBySectionId] = useState<Record<string, DocBlock[]>>({})
+  const [playgroundOutputByBlockId, setPlaygroundOutputByBlockId] = useState<Record<string, PlaygroundRunResponse>>({})
+  const [playgroundRunStateByBlockId, setPlaygroundRunStateByBlockId] = useState<Record<string, 'idle' | 'running'>>({})
   const [pendingImageInsertIndex, setPendingImageInsertIndex] = useState<number | null>(null)
   const [pendingImageBlockId, setPendingImageBlockId] = useState<string | null>(null)
   const [slashMenuBlockId, setSlashMenuBlockId] = useState<string | null>(null)
+  const [slashMenuIndex, setSlashMenuIndex] = useState(0)
   const [focusBlockId, setFocusBlockId] = useState<string | null>(null)
 
   const selectedNodes = useMemo(
@@ -442,7 +834,16 @@ function App() {
   const selectedEdge = edges.find((edge) => edge.id === selectedEdgeId) ?? null
   const selectedSection = findSection(sections, selectedSectionId)
   const sectionOptions = useMemo(() => flattenSections(sections), [sections])
+  const filteredSections = useMemo(
+    () => filterSectionsByQuery(sections, sectionSearch),
+    [sectionSearch, sections],
+  )
+  const filteredSectionCount = useMemo(() => countSections(filteredSections), [filteredSections])
   const selectedSectionBlocks = selectedSectionId ? docBlocksBySectionId[selectedSectionId] ?? [] : []
+  const shouldRenderTrailingPlaceholder =
+    selectedSectionBlocks.length === 0 ||
+    selectedSectionBlocks[selectedSectionBlocks.length - 1]?.type !== 'text' ||
+    selectedSectionBlocks[selectedSectionBlocks.length - 1]?.value.trim() !== ''
   const linkedSection = selectedNode
     ? findSection(sections, selectedNode.document_section_id ?? null)
     : null
@@ -854,6 +1255,49 @@ function App() {
     )
   }
 
+  function deleteSection(sectionId: string) {
+    const sectionToDelete = findSection(sections, sectionId)
+
+    if (!sectionToDelete || !window.confirm(`Delete "${sectionToDelete.title || 'Untitled'}" and all nested subchapters?`)) {
+      return
+    }
+
+    let nextSelectedSectionId: string | null = null
+
+    setSections((currentSections) => {
+      const { nextSections, removedSection } = removeSectionFromTree(currentSections, sectionId)
+
+      if (!removedSection) {
+        nextSelectedSectionId = selectedSectionId
+        return currentSections
+      }
+
+      const removedIds = new Set(collectSectionIds(removedSection))
+
+      if (selectedSectionId && !removedIds.has(selectedSectionId)) {
+        nextSelectedSectionId = selectedSectionId
+      } else {
+        nextSelectedSectionId = flattenSections(nextSections)[0]?.id ?? null
+      }
+
+      setDocBlocksBySectionId((currentBlocks) => {
+        const nextBlocks = { ...currentBlocks }
+
+        for (const removedId of removedIds) {
+          delete nextBlocks[removedId]
+        }
+
+        return nextBlocks
+      })
+
+      return nextSections
+    })
+
+    setSelectedSectionId(nextSelectedSectionId)
+    setEditingSectionId(null)
+    setDocMessage('Chapter deleted')
+  }
+
   function updateSelectedSectionContent(content: string) {
     if (!selectedSectionId) {
       return
@@ -882,6 +1326,8 @@ function App() {
       heading: '',
       image: '',
       code: '',
+      playground: "print('Hello from playground')",
+      terminal: stringifyTerminalBlockConfig(createDefaultTerminalConfig()),
       quote: '',
     }
 
@@ -908,8 +1354,10 @@ function App() {
     let nextBlocks: DocBlock[]
 
     if (pendingImageBlockId) {
-      nextBlocks = selectedSectionBlocks.map((block) =>
-        block.id === pendingImageBlockId ? { ...block, type: 'image', value: '', font: undefined } : block,
+      nextBlocks = selectedSectionBlocks.map((block): DocBlock =>
+        block.id === pendingImageBlockId
+          ? { ...block, type: 'image', value: '', font: undefined }
+          : block,
       )
     } else {
       const insertIndex = pendingImageInsertIndex ?? selectedSectionBlocks.length
@@ -929,19 +1377,24 @@ function App() {
     const cleanedValue = currentBlock?.value.trim() === '/' ? '' : currentBlock?.value.replace(/\/$/, '') ?? ''
 
     setSlashMenuBlockId(null)
+    setSlashMenuIndex(0)
 
     if (type === 'image') {
-      updateSelectedSectionBlocks(
-        selectedSectionBlocks.map((block) =>
-          block.id === blockId ? { ...block, type: 'image', value: '', font: undefined } : block,
-        ),
+      const imageBlocks = selectedSectionBlocks.map((block): DocBlock =>
+        block.id === blockId
+          ? { ...block, type: 'image', value: '', font: undefined }
+          : block,
       )
+      const { blocks: nextBlocks, insertedBlockId } = ensureTextBlockAfter(imageBlocks, blockId)
+      updateSelectedSectionBlocks(nextBlocks)
+      if (insertedBlockId) {
+        setFocusBlockId(insertedBlockId)
+      }
       requestImageForBlock(blockId)
       return
     }
 
-    updateSelectedSectionBlocks(
-      selectedSectionBlocks.map((block) =>
+    const transformedBlocks = selectedSectionBlocks.map((block) =>
         block.id === blockId
           ? {
               ...block,
@@ -950,8 +1403,17 @@ function App() {
               font: type === 'text' ? (block.font ?? 'default') : undefined,
             }
           : block,
-      ),
-    )
+      )
+
+    if (type === 'text') {
+      updateSelectedSectionBlocks(transformedBlocks)
+      setFocusBlockId(blockId)
+      return
+    }
+
+    const { blocks: nextBlocks } = ensureTextBlockAfter(transformedBlocks, blockId)
+    updateSelectedSectionBlocks(nextBlocks)
+    setFocusBlockId(blockId)
   }
 
   function handleEditableBlockChange(
@@ -966,17 +1428,85 @@ function App() {
     }
 
     setSlashMenuBlockId(shouldOpenSlashMenu ? block.id : null)
+    setSlashMenuIndex(0)
     updateContentBlock(block.id, value)
   }
 
-  function handleEmptyEditorChange(event: ChangeEvent<HTMLTextAreaElement>) {
+  function handlePlaceholderEditorChange(event: ChangeEvent<HTMLTextAreaElement>) {
     const value = event.target.value
     const block = createContentBlock('text', value)
+    const nextBlocks =
+      selectedSectionBlocks.length > 0 ? [...selectedSectionBlocks, block] : [block]
 
     resizeTextarea(event.currentTarget)
-    updateSelectedSectionBlocks([block])
+    updateSelectedSectionBlocks(nextBlocks)
     setSlashMenuBlockId(value.endsWith('/') ? block.id : null)
+    setSlashMenuIndex(0)
     setFocusBlockId(block.id)
+  }
+
+  function focusNearestEditableBlock(blocks: DocBlock[], startIndex: number) {
+    for (let index = startIndex; index >= 0; index -= 1) {
+      if (blocks[index].type !== 'image') {
+        setFocusBlockId(blocks[index].id)
+        return
+      }
+    }
+
+    for (let index = startIndex + 1; index < blocks.length; index += 1) {
+      if (blocks[index].type !== 'image') {
+        setFocusBlockId(blocks[index].id)
+        return
+      }
+    }
+  }
+
+  function focusAdjacentEditableBlock(blockId: string, direction: -1 | 1) {
+    const blockIndex = selectedSectionBlocks.findIndex((block) => block.id === blockId)
+
+    if (blockIndex < 0) {
+      return false
+    }
+
+    for (
+      let index = blockIndex + direction;
+      index >= 0 && index < selectedSectionBlocks.length;
+      index += direction
+    ) {
+      if (selectedSectionBlocks[index].type !== 'image') {
+        setFocusBlockId(selectedSectionBlocks[index].id)
+        return true
+      }
+    }
+
+    if (direction > 0 && shouldRenderTrailingPlaceholder) {
+      setFocusBlockId('empty-doc-editor')
+      return true
+    }
+
+    return false
+  }
+
+  function ensureTextBlockAfter(
+    blocks: DocBlock[],
+    blockId: string,
+  ): { blocks: DocBlock[]; insertedBlockId: string | null } {
+    const blockIndex = blocks.findIndex((block) => block.id === blockId)
+
+    if (blockIndex < 0) {
+      return { blocks, insertedBlockId: null }
+    }
+
+    const nextBlock = blocks[blockIndex + 1]
+
+    if (nextBlock?.type === 'text' && !nextBlock.value.trim()) {
+      return { blocks, insertedBlockId: nextBlock.id }
+    }
+
+    const newTextBlock = createContentBlock('text')
+    const nextBlocks = [...blocks]
+    nextBlocks.splice(blockIndex + 1, 0, newTextBlock)
+    return { blocks: nextBlocks, insertedBlockId: newTextBlock.id }
   }
 
   function insertTextBlockAfter(blockId: string) {
@@ -991,7 +1521,114 @@ function App() {
     nextBlocks.splice(blockIndex + 1, 0, nextBlock)
     updateSelectedSectionBlocks(nextBlocks)
     setSlashMenuBlockId(null)
+    setSlashMenuIndex(0)
     setFocusBlockId(nextBlock.id)
+  }
+
+  function handleBlockBackspace(
+    event: ReactKeyboardEvent<HTMLInputElement | HTMLTextAreaElement>,
+    block: DocBlock,
+  ) {
+    if (event.key !== 'Backspace') {
+      return
+    }
+
+    const target = event.currentTarget
+    const isEmptyAtStart =
+      target.value.length === 0 && target.selectionStart === 0 && target.selectionEnd === 0
+
+    if (!isEmptyAtStart || selectedSectionBlocks.length <= 1) {
+      return
+    }
+
+    const blockIndex = selectedSectionBlocks.findIndex((currentBlock) => currentBlock.id === block.id)
+
+    if (blockIndex <= 0) {
+      return
+    }
+
+    event.preventDefault()
+
+    const nextBlocks = selectedSectionBlocks.filter((currentBlock) => currentBlock.id !== block.id)
+    updateSelectedSectionBlocks(nextBlocks)
+    focusNearestEditableBlock(nextBlocks, blockIndex - 1)
+    setSlashMenuBlockId(null)
+    setSlashMenuIndex(0)
+  }
+
+  function handleBlockArrowNavigation(
+    event: ReactKeyboardEvent<HTMLInputElement | HTMLTextAreaElement>,
+    block: DocBlock,
+  ) {
+    const target = event.currentTarget
+    const selectionStart = target.selectionStart ?? 0
+    const selectionEnd = target.selectionEnd ?? 0
+    const valueLength = target.value.length
+
+    if (event.key === 'ArrowUp' && selectionStart === 0 && selectionEnd === 0) {
+      if (focusAdjacentEditableBlock(block.id, -1)) {
+        event.preventDefault()
+      }
+      return
+    }
+
+    if (event.key === 'ArrowDown' && selectionStart === valueLength && selectionEnd === valueLength) {
+      if (focusAdjacentEditableBlock(block.id, 1)) {
+        event.preventDefault()
+      }
+    }
+  }
+
+  function moveSlashMenuSelection(direction: 1 | -1) {
+    setSlashMenuIndex((currentIndex) => {
+      const nextIndex = currentIndex + direction
+
+      if (nextIndex < 0) {
+        return slashCommands.length - 1
+      }
+
+      if (nextIndex >= slashCommands.length) {
+        return 0
+      }
+
+      return nextIndex
+    })
+  }
+
+  function handleSlashMenuKeyDown(
+    event: ReactKeyboardEvent<HTMLInputElement | HTMLTextAreaElement>,
+    blockId: string,
+  ) {
+    if (slashMenuBlockId !== blockId) {
+      return false
+    }
+
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      moveSlashMenuSelection(1)
+      return true
+    }
+
+    if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      moveSlashMenuSelection(-1)
+      return true
+    }
+
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      transformContentBlock(blockId, slashCommands[slashMenuIndex].type)
+      return true
+    }
+
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      setSlashMenuBlockId(null)
+      setSlashMenuIndex(0)
+      return true
+    }
+
+    return false
   }
 
   function handleBlockEnter(
@@ -1013,17 +1650,46 @@ function App() {
 
     return (
       <div className="slash-menu" onMouseDown={(event) => event.preventDefault()}>
-        {slashCommands.map((command) => (
+        {slashCommands.map((command, index) => (
           <button
-            className="slash-command"
+            className={`slash-command${index === slashMenuIndex ? ' active' : ''}`}
             key={command.type}
             type="button"
+            onMouseEnter={() => setSlashMenuIndex(index)}
             onClick={() => transformContentBlock(blockId, command.type)}
           >
             <span className="slash-command-label">{command.label}</span>
             <span className="slash-command-hint">{command.hint}</span>
           </button>
         ))}
+      </div>
+    )
+  }
+
+  function renderTrailingPlaceholder() {
+    if (!shouldRenderTrailingPlaceholder) {
+      return null
+    }
+
+    return (
+      <div className="content-block text-block trailing-placeholder-block">
+        <div className="markdown-block-editor">
+          <textarea
+            data-block-id="empty-doc-editor"
+            className="auto-textarea markdown-source"
+            placeholder="Type / for commands"
+            onBlur={() => {
+              setSlashMenuBlockId(null)
+              setSlashMenuIndex(0)
+            }}
+            onKeyDown={(event) => {
+              if (slashMenuBlockId && handleSlashMenuKeyDown(event, slashMenuBlockId)) {
+                return
+              }
+            }}
+            onChange={handlePlaceholderEditorChange}
+          />
+        </div>
       </div>
     )
   }
@@ -1055,6 +1721,102 @@ function App() {
 
   function removeContentBlock(blockId: string) {
     updateSelectedSectionBlocks(selectedSectionBlocks.filter((block) => block.id !== blockId))
+    setPlaygroundOutputByBlockId((current) => {
+      const next = { ...current }
+      delete next[blockId]
+      return next
+    })
+    setPlaygroundRunStateByBlockId((current) => {
+      const next = { ...current }
+      delete next[blockId]
+      return next
+    })
+  }
+
+  function duplicateContentBlock(blockId: string) {
+    const blockIndex = selectedSectionBlocks.findIndex((block) => block.id === blockId)
+
+    if (blockIndex < 0) {
+      return
+    }
+
+    const sourceBlock = selectedSectionBlocks[blockIndex]
+    const duplicatedBlock: DocBlock = {
+      ...sourceBlock,
+      id: createId(),
+    }
+    const nextBlocks = [...selectedSectionBlocks]
+    nextBlocks.splice(blockIndex + 1, 0, duplicatedBlock)
+    updateSelectedSectionBlocks(nextBlocks)
+    setFocusBlockId(duplicatedBlock.id)
+    setDocMessage('Block duplicated')
+  }
+
+  function moveContentBlock(blockId: string, direction: -1 | 1) {
+    const blockIndex = selectedSectionBlocks.findIndex((block) => block.id === blockId)
+    const nextIndex = blockIndex + direction
+
+    if (blockIndex < 0 || nextIndex < 0 || nextIndex >= selectedSectionBlocks.length) {
+      return
+    }
+
+    const nextBlocks = [...selectedSectionBlocks]
+    const [movedBlock] = nextBlocks.splice(blockIndex, 1)
+    nextBlocks.splice(nextIndex, 0, movedBlock)
+    updateSelectedSectionBlocks(nextBlocks)
+    setFocusBlockId(blockId)
+  }
+
+  async function runPlaygroundBlock(block: DocBlock) {
+    if (!session || block.type !== 'playground') {
+      return
+    }
+
+    setPlaygroundRunStateByBlockId((current) => ({
+      ...current,
+      [block.id]: 'running',
+    }))
+
+    try {
+      const response = await fetch(`${apiUrl}/playground/run`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${session.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ code: block.value }),
+      })
+
+      if (response.status === 401) {
+        expireSession()
+        return
+      }
+
+      if (!response.ok) {
+        throw new Error('Unable to run playground code')
+      }
+
+      const result = (await response.json()) as PlaygroundRunResponse
+      setPlaygroundOutputByBlockId((current) => ({
+        ...current,
+        [block.id]: result,
+      }))
+    } catch {
+      setPlaygroundOutputByBlockId((current) => ({
+        ...current,
+        [block.id]: {
+          success: false,
+          exit_code: 1,
+          stdout: '',
+          stderr: 'Unable to run playground code',
+        },
+      }))
+    } finally {
+      setPlaygroundRunStateByBlockId((current) => ({
+        ...current,
+        [block.id]: 'idle',
+      }))
+    }
   }
 
   async function saveDocument(sectionsToSave = sections) {
@@ -1215,6 +1977,17 @@ function App() {
                 }}
               >
                 ✎
+              </button>
+              <button
+                className="doc-title-delete-button"
+                type="button"
+                aria-label="Delete chapter"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  deleteSection(section.id)
+                }}
+              >
+                🗑
               </button>
             </>
           )}
@@ -1450,9 +2223,33 @@ function App() {
 
               <div className="docs-layout">
                 <aside className="docs-sidebar" aria-label="Documentation chapters">
-                  <h2>Chapters</h2>
+                  <div className="docs-sidebar-header">
+                    <h2>Chapters</h2>
+                    <input
+                      className="section-search-input"
+                      type="search"
+                      value={sectionSearch}
+                      placeholder="Search chapters"
+                      onChange={(event) => setSectionSearch(event.target.value)}
+                    />
+                    {sectionSearch.trim() ? (
+                      <p className="section-search-status">
+                        {filteredSectionCount > 0
+                          ? `${filteredSectionCount} result${filteredSectionCount === 1 ? '' : 's'}`
+                          : 'No matches'}
+                      </p>
+                    ) : null}
+                  </div>
                   <nav className="doc-tree">
-                    {sections.length > 0 ? renderSectionTree(sections) : <p>No chapters yet</p>}
+                    {sections.length > 0 ? (
+                      filteredSections.length > 0 ? (
+                        renderSectionTree(filteredSections)
+                      ) : (
+                        <p>No chapters found</p>
+                      )
+                    ) : (
+                      <p>No chapters yet</p>
+                    )}
                   </nav>
                 </aside>
 
@@ -1487,14 +2284,42 @@ function App() {
                             {selectedSectionBlocks.map((block) => (
                               <div className="block-with-divider" key={block.id}>
                                 <div className={`content-block ${block.type}-block`}>
-                                  <button
-                                    className="block-remove-button"
-                                    type="button"
-                                    aria-label="Remove block"
-                                    onClick={() => removeContentBlock(block.id)}
-                                  >
-                                    ×
-                                  </button>
+                                  <div className="block-actions">
+                                    <button
+                                      className="block-action-button"
+                                      type="button"
+                                      aria-label="Move block up"
+                                      disabled={selectedSectionBlocks[0]?.id === block.id}
+                                      onClick={() => moveContentBlock(block.id, -1)}
+                                    >
+                                      ↑
+                                    </button>
+                                    <button
+                                      className="block-action-button"
+                                      type="button"
+                                      aria-label="Move block down"
+                                      disabled={selectedSectionBlocks[selectedSectionBlocks.length - 1]?.id === block.id}
+                                      onClick={() => moveContentBlock(block.id, 1)}
+                                    >
+                                      ↓
+                                    </button>
+                                    <button
+                                      className="block-action-button"
+                                      type="button"
+                                      aria-label="Duplicate block"
+                                      onClick={() => duplicateContentBlock(block.id)}
+                                    >
+                                      ⧉
+                                    </button>
+                                    <button
+                                      className="block-remove-button"
+                                      type="button"
+                                      aria-label="Remove block"
+                                      onClick={() => removeContentBlock(block.id)}
+                                    >
+                                      ×
+                                    </button>
+                                  </div>
 
                                   {block.type === 'heading' && (
                                     <input
@@ -1503,7 +2328,11 @@ function App() {
                                       type="text"
                                       value={block.value}
                                       placeholder="Heading 1"
-                                      onKeyDown={(event) => handleBlockEnter(event, block.id)}
+                                      onKeyDown={(event) => {
+                                        handleBlockArrowNavigation(event, block)
+                                        handleBlockBackspace(event, block)
+                                        handleBlockEnter(event, block.id)
+                                      }}
                                       onChange={(event) => handleEditableBlockChange(event, block)}
                                     />
                                   )}
@@ -1536,16 +2365,86 @@ function App() {
                                         <code>{highlightCode(block.value)}</code>
                                       </pre>
                                       <textarea
+                                        data-block-id={block.id}
                                         className="code-input auto-textarea"
                                         value={block.value}
                                         placeholder="Code"
                                         spellCheck={false}
+                                        onKeyDown={(event) => {
+                                          handleBlockArrowNavigation(event, block)
+                                          handleBlockBackspace(event, block)
+                                        }}
                                         onChange={(event) => {
                                           resizeTextarea(event.currentTarget)
                                           updateContentBlock(block.id, event.target.value)
                                         }}
                                       />
                                     </div>
+                                  )}
+
+                                  {block.type === 'playground' && (
+                                    <div className="playground-editor">
+                                      <div className="playground-toolbar">
+                                        <span className="playground-badge">Python</span>
+                                        <button
+                                          className="playground-run-button"
+                                          type="button"
+                                          onClick={() => runPlaygroundBlock(block)}
+                                        >
+                                          {playgroundRunStateByBlockId[block.id] === 'running' ? 'Running...' : 'Run'}
+                                        </button>
+                                      </div>
+                                      <div className="code-editor">
+                                        <pre className="code-highlight" aria-hidden="true">
+                                          <code>{highlightCode(block.value)}</code>
+                                        </pre>
+                                        <textarea
+                                          data-block-id={block.id}
+                                          className="code-input auto-textarea"
+                                          value={block.value}
+                                          placeholder="Python code"
+                                          spellCheck={false}
+                                          onKeyDown={(event) => {
+                                            handleBlockBackspace(event, block)
+                                          }}
+                                          onChange={(event) => {
+                                            resizeTextarea(event.currentTarget)
+                                            updateContentBlock(block.id, event.target.value)
+                                          }}
+                                        />
+                                      </div>
+                                      {playgroundOutputByBlockId[block.id] && (
+                                        <div
+                                          className={
+                                            playgroundOutputByBlockId[block.id].success
+                                              ? 'playground-output success'
+                                              : 'playground-output error'
+                                          }
+                                        >
+                                          <div className="playground-output-header">
+                                            Exit code: {playgroundOutputByBlockId[block.id].exit_code}
+                                          </div>
+                                          <pre>
+                                            {playgroundOutputByBlockId[block.id].stdout ||
+                                              playgroundOutputByBlockId[block.id].stderr ||
+                                              'No output'}
+                                            {playgroundOutputByBlockId[block.id].stdout &&
+                                            playgroundOutputByBlockId[block.id].stderr
+                                              ? `\n${playgroundOutputByBlockId[block.id].stderr}`
+                                              : ''}
+                                          </pre>
+                                        </div>
+                                      )}
+                                    </div>
+                                  )}
+
+                                  {block.type === 'terminal' && (
+                                    <TerminalBlock
+                                      blockId={block.id}
+                                      value={block.value}
+                                      session={session}
+                                      onChange={(nextValue) => updateContentBlock(block.id, nextValue)}
+                                    />
                                   )}
 
                                   {block.type === 'text' && (
@@ -1555,12 +2454,17 @@ function App() {
                                         className="auto-textarea markdown-source"
                                         value={block.value}
                                         placeholder="Type / for commands"
-                                        onBlur={() => setSlashMenuBlockId(null)}
+                                        onBlur={() => {
+                                          setSlashMenuBlockId(null)
+                                          setSlashMenuIndex(0)
+                                        }}
                                         onKeyDown={(event) => {
-                                          if (event.key === 'Escape') {
-                                            setSlashMenuBlockId(null)
+                                          if (handleSlashMenuKeyDown(event, block.id)) {
+                                            return
                                           }
 
+                                          handleBlockArrowNavigation(event, block)
+                                          handleBlockBackspace(event, block)
                                           handleBlockEnter(event, block.id)
                                         }}
                                         onChange={(event) => {
@@ -1573,9 +2477,14 @@ function App() {
 
                                   {block.type === 'quote' && (
                                     <textarea
+                                      data-block-id={block.id}
                                       className="auto-textarea"
                                       value={block.value}
                                       placeholder="Quote"
+                                      onKeyDown={(event) => {
+                                        handleBlockArrowNavigation(event, block)
+                                        handleBlockBackspace(event, block)
+                                      }}
                                       onChange={(event) => {
                                         resizeTextarea(event.currentTarget)
                                         updateContentBlock(block.id, event.target.value)
@@ -1585,18 +2494,10 @@ function App() {
                                 </div>
                               </div>
                             ))}
+                            {renderTrailingPlaceholder()}
                           </>
                         ) : (
-                          <div className="content-block text-block">
-                            <div className="markdown-block-editor">
-                              <textarea
-                                data-block-id="empty-doc-editor"
-                                className="auto-textarea markdown-source"
-                                placeholder="Type / for commands"
-                                onChange={handleEmptyEditorChange}
-                              />
-                            </div>
-                          </div>
+                          renderTrailingPlaceholder()
                         )}
                       </div>
                     </>

@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import secrets
 import shutil
 import sqlite3
+import subprocess
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, status
+import paramiko
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
@@ -72,6 +78,41 @@ class LoginResponse(BaseModel):
 class AssetUploadResponse(BaseModel):
     relative_path: str
     url: str
+
+
+class PlaygroundRunRequest(BaseModel):
+    code: str
+
+
+class PlaygroundRunResponse(BaseModel):
+    success: bool
+    exit_code: int
+    stdout: str
+    stderr: str
+
+
+class TerminalOpenRequest(BaseModel):
+    connection_string: str = ""
+    host: str = ""
+    port: int = 22
+    username: str = ""
+    password: str = ""
+
+
+class TerminalOpenResponse(BaseModel):
+    session_id: str
+    host: str
+    port: int
+    username: str
+
+
+@dataclass
+class TerminalSession:
+    client: paramiko.SSHClient
+    channel: paramiko.Channel
+
+
+terminal_sessions: dict[str, TerminalSession] = {}
 
 
 def get_connection() -> sqlite3.Connection:
@@ -224,6 +265,52 @@ def require_token(authorization: Annotated[str | None, Header()] = None) -> None
         )
 
 
+def require_token_value(authorization: str | None) -> None:
+    if authorization != "Bearer hardcoded-token":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+
+
+def parse_terminal_target(payload: TerminalOpenRequest) -> tuple[str, int, str, str]:
+    host = payload.host.strip()
+    port = payload.port
+    username = payload.username.strip()
+    password = payload.password
+
+    if payload.connection_string.strip():
+        parsed = urlparse(payload.connection_string.strip())
+
+        if parsed.scheme and parsed.scheme != "ssh":
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Only ssh:// connections are supported")
+
+        host = parsed.hostname or host
+        port = parsed.port or port
+        username = parsed.username or username
+        password = parsed.password or password
+
+    if not host or not username or not password:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Host, username and password are required",
+        )
+
+    return host, port, username, password
+
+
+def close_terminal_session(session_id: str) -> None:
+    session = terminal_sessions.pop(session_id, None)
+
+    if session is None:
+        return
+
+    try:
+        session.channel.close()
+    finally:
+        session.client.close()
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_database()
@@ -360,3 +447,119 @@ def get_document_asset(document_name: str, section_id: str, filename: str) -> Fi
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
 
     return FileResponse(asset_path)
+
+
+@app.post(
+    "/playground/run",
+    response_model=PlaygroundRunResponse,
+    dependencies=[Depends(require_token)],
+)
+def run_playground_code(payload: PlaygroundRunRequest) -> PlaygroundRunResponse:
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", payload.code],
+            capture_output=True,
+            text=True,
+            cwd=documents_path,
+            timeout=5,
+        )
+    except subprocess.TimeoutExpired as error:
+        return PlaygroundRunResponse(
+            success=False,
+            exit_code=124,
+            stdout=error.stdout or "",
+            stderr=(error.stderr or "") + ("\nExecution timed out after 5 seconds." if error.stderr else "Execution timed out after 5 seconds."),
+        )
+
+    return PlaygroundRunResponse(
+        success=completed.returncode == 0,
+        exit_code=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
+
+
+@app.post(
+    "/terminal/sessions/open",
+    response_model=TerminalOpenResponse,
+    dependencies=[Depends(require_token)],
+)
+def open_terminal_session(payload: TerminalOpenRequest) -> TerminalOpenResponse:
+    host, port, username, password = parse_terminal_target(payload)
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        client.connect(
+            hostname=host,
+            port=port,
+            username=username,
+            password=password,
+            look_for_keys=False,
+            allow_agent=False,
+            timeout=8,
+        )
+        channel = client.invoke_shell(term="xterm", width=140, height=36)
+        channel.settimeout(0.0)
+    except Exception as error:
+        client.close()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unable to open terminal session: {error}",
+        ) from error
+
+    session_id = secrets.token_urlsafe(18)
+    terminal_sessions[session_id] = TerminalSession(client=client, channel=channel)
+    return TerminalOpenResponse(session_id=session_id, host=host, port=port, username=username)
+
+
+@app.post(
+    "/terminal/sessions/{session_id}/close",
+    dependencies=[Depends(require_token)],
+)
+def close_terminal_session_route(session_id: str) -> dict[str, bool]:
+    close_terminal_session(session_id)
+    return {"closed": True}
+
+
+@app.websocket("/terminal/sessions/{session_id}/ws")
+async def terminal_session_ws(websocket: WebSocket, session_id: str, token: str | None = None) -> None:
+    if token != "hardcoded-token":
+        await websocket.close(code=4401)
+        return
+
+    session = terminal_sessions.get(session_id)
+
+    if session is None:
+        await websocket.close(code=4404)
+        return
+
+    await websocket.accept()
+
+    async def pump_terminal_output() -> None:
+        while True:
+            if session.channel.closed or session.channel.exit_status_ready():
+                break
+
+            if session.channel.recv_ready():
+                data = session.channel.recv(4096)
+
+                if not data:
+                    break
+
+                await websocket.send_text(data.decode("utf-8", errors="ignore"))
+            else:
+                await asyncio.sleep(0.03)
+
+    output_task = asyncio.create_task(pump_terminal_output())
+
+    try:
+        while True:
+            data = await websocket.receive_text()
+            session.channel.send(data)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        output_task.cancel()
+        close_terminal_session(session_id)
