@@ -1,5 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties, FormEvent, MouseEvent, PointerEvent, WheelEvent } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import type {
+  CSSProperties,
+  ChangeEvent,
+  FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent,
+  PointerEvent,
+  WheelEvent,
+} from 'react'
 import './App.css'
 
 type LoginState = 'idle' | 'loading' | 'success' | 'error'
@@ -59,11 +67,19 @@ type SectionOption = {
 }
 
 type DocBlockType = 'text' | 'heading' | 'image' | 'code' | 'quote'
+type TextFont = 'default' | 'serif' | 'mono' | 'display'
 
 type DocBlock = {
   id: string
   type: DocBlockType
   value: string
+  font?: TextFont
+}
+
+type SlashCommand = {
+  type: DocBlockType
+  label: string
+  hint: string
 }
 
 type Point = {
@@ -82,6 +98,20 @@ type PanDrag = {
 const apiUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
 const graphName = 'default'
 const documentName = 'default'
+const sessionStorageKey = 'woxverse-session'
+const textFontOptions: Array<{ value: TextFont; label: string }> = [
+  { value: 'default', label: 'Default' },
+  { value: 'serif', label: 'Serif' },
+  { value: 'mono', label: 'Mono' },
+  { value: 'display', label: 'Display' },
+]
+const slashCommands: SlashCommand[] = [
+  { type: 'text', label: 'Text', hint: 'Plain markdown text' },
+  { type: 'heading', label: 'H1', hint: 'Large section heading' },
+  { type: 'image', label: 'Image', hint: 'Upload and insert a photo' },
+  { type: 'code', label: 'Code', hint: 'Highlighted code block' },
+  { type: 'quote', label: 'Quote', hint: 'Callout quote text' },
+]
 
 function createId(): string {
   return crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
@@ -126,16 +156,101 @@ function getNodeRadius(label: string): number {
   return Math.max(30, Math.min(82, label.length * 4.2 + 16))
 }
 
+function resizeTextarea(textarea: HTMLTextAreaElement) {
+  textarea.style.height = 'auto'
+  textarea.style.height = `${textarea.scrollHeight}px`
+}
+
+function normalizeTextFont(value: string | undefined): TextFont {
+  return textFontOptions.some((option) => option.value === value) ? (value as TextFont) : 'default'
+}
+
+function splitMarkdownBlocks(content: string): string[] {
+  const blocks: string[] = []
+  const lines = content.split('\n')
+  let current: string[] = []
+  let inFontBlock = false
+  let inCodeBlock = false
+
+  function pushCurrentBlock() {
+    const value = current.join('\n').trim()
+
+    if (value) {
+      blocks.push(value)
+    }
+
+    current = []
+  }
+
+  for (const line of lines) {
+    if (!inFontBlock && line.trim().startsWith('```')) {
+      if (!inCodeBlock) {
+        pushCurrentBlock()
+        inCodeBlock = true
+        current.push(line)
+        continue
+      }
+
+      current.push(line)
+      inCodeBlock = false
+      pushCurrentBlock()
+      continue
+    }
+
+    if (inCodeBlock) {
+      current.push(line)
+      continue
+    }
+
+    if (!inFontBlock && /^<div\s+data-font="[^"]+">\s*$/.test(line.trim())) {
+      pushCurrentBlock()
+      inFontBlock = true
+      current.push(line)
+      continue
+    }
+
+    if (inFontBlock) {
+      current.push(line)
+
+      if (line.trim() === '</div>') {
+        inFontBlock = false
+        pushCurrentBlock()
+      }
+
+      continue
+    }
+
+    if (!line.trim()) {
+      pushCurrentBlock()
+      continue
+    }
+
+    current.push(line)
+  }
+
+  pushCurrentBlock()
+  return blocks
+}
+
 function parseMarkdownBlocks(content: string): DocBlock[] {
   if (!content.trim()) {
     return []
   }
 
-  return content
-    .split(/\n{2,}/)
+  return splitMarkdownBlocks(content)
     .map((block): DocBlock => {
       const trimmedBlock = block.trim()
+      const fontMatch = trimmedBlock.match(/^<div\s+data-font="([^"]+)">\n?([\s\S]*?)\n?<\/div>$/)
       const imageMatch = trimmedBlock.match(/^!\[[^\]]*]\((.*)\)$/)
+
+      if (fontMatch) {
+        return {
+          id: createId(),
+          type: 'text',
+          value: fontMatch[2],
+          font: normalizeTextFont(fontMatch[1]),
+        }
+      }
 
       if (imageMatch) {
         return { id: createId(), type: 'image', value: imageMatch[1] }
@@ -164,7 +279,7 @@ function parseMarkdownBlocks(content: string): DocBlock[] {
         }
       }
 
-      return { id: createId(), type: 'text', value: trimmedBlock }
+      return { id: createId(), type: 'text', value: trimmedBlock, font: 'default' }
     })
 }
 
@@ -190,6 +305,10 @@ function serializeMarkdownBlocks(blocks: DocBlock[]): string {
           .join('\n')
       }
 
+      if (block.type === 'text' && block.font && block.font !== 'default') {
+        return `<div data-font="${block.font}">\n${block.value}\n</div>`
+      }
+
       return block.value
     })
     .filter(Boolean)
@@ -207,6 +326,37 @@ function getImagePreviewUrl(documentName: string, sectionId: string | null, valu
 
   const filename = value.replace(/^assets\//, '')
   return `${apiUrl}/documents/${documentName}/sections/${sectionId}/assets/${encodeURIComponent(filename)}`
+}
+
+function highlightCode(value: string) {
+  const tokenPattern =
+    /(\/\/.*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|`(?:\\.|[^`])*`|\b\d+(?:\.\d+)?\b|\b(?:and|as|async|await|break|case|catch|class|const|continue|def|else|export|False|false|finally|for|from|function|if|import|in|interface|is|lambda|let|new|None|null|not|or|return|self|throw|true|True|try|type|undefined|var|while|with|yield)\b)/g
+
+  return value.split(tokenPattern).map((part, index) => {
+    if (!part) {
+      return null
+    }
+
+    let className = ''
+
+    if (/^(\/\/|\/\*)/.test(part)) {
+      className = 'token-comment'
+    } else if (/^["'`]/.test(part)) {
+      className = 'token-string'
+    } else if (/^\d/.test(part)) {
+      className = 'token-number'
+    } else if (/^[a-zA-Z_]/.test(part)) {
+      className = 'token-keyword'
+    }
+
+    return className ? (
+      <span className={className} key={`${part}-${index}`}>
+        {part}
+      </span>
+    ) : (
+      part
+    )
+  })
 }
 
 function buildBlocksBySectionId(sections: DocSection[]): Record<string, DocBlock[]> {
@@ -236,6 +386,26 @@ function updateSectionTree(
   })
 }
 
+function loadStoredSession(): UserSession | null {
+  try {
+    const storedSession = localStorage.getItem(sessionStorageKey)
+    const parsedSession = storedSession ? (JSON.parse(storedSession) as Partial<UserSession>) : null
+
+    if (!parsedSession?.username || !parsedSession.token) {
+      localStorage.removeItem(sessionStorageKey)
+      return null
+    }
+
+    return {
+      username: parsedSession.username,
+      token: parsedSession.token,
+    }
+  } catch {
+    localStorage.removeItem(sessionStorageKey)
+    return null
+  }
+}
+
 function App() {
   const canvasRef = useRef<SVGSVGElement | null>(null)
   const imageInputRef = useRef<HTMLInputElement | null>(null)
@@ -246,7 +416,7 @@ function App() {
   const [message, setMessage] = useState('')
   const [graphMessage, setGraphMessage] = useState('')
   const [docMessage, setDocMessage] = useState('')
-  const [session, setSession] = useState<UserSession | null>(null)
+  const [session, setSession] = useState<UserSession | null>(() => loadStoredSession())
   const [nodes, setNodes] = useState<GraphNode[]>([])
   const [edges, setEdges] = useState<GraphEdge[]>([])
   const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([])
@@ -257,7 +427,12 @@ function App() {
   const [panDrag, setPanDrag] = useState<PanDrag | null>(null)
   const [sections, setSections] = useState<DocSection[]>([])
   const [selectedSectionId, setSelectedSectionId] = useState<string | null>(null)
+  const [editingSectionId, setEditingSectionId] = useState<string | null>(null)
   const [docBlocksBySectionId, setDocBlocksBySectionId] = useState<Record<string, DocBlock[]>>({})
+  const [pendingImageInsertIndex, setPendingImageInsertIndex] = useState<number | null>(null)
+  const [pendingImageBlockId, setPendingImageBlockId] = useState<string | null>(null)
+  const [slashMenuBlockId, setSlashMenuBlockId] = useState<string | null>(null)
+  const [focusBlockId, setFocusBlockId] = useState<string | null>(null)
 
   const selectedNodes = useMemo(
     () => nodes.filter((node) => selectedNodeIds.includes(node.id)),
@@ -272,6 +447,13 @@ function App() {
     ? findSection(sections, selectedNode.document_section_id ?? null)
     : null
 
+  function expireSession() {
+    localStorage.removeItem(sessionStorageKey)
+    setSession(null)
+    setLoginState('idle')
+    setMessage('Session expired')
+  }
+
   useEffect(() => {
     if (!session) {
       return
@@ -284,6 +466,11 @@ function App() {
             Authorization: `Bearer ${session?.token}`,
           },
         })
+
+        if (response.status === 401) {
+          expireSession()
+          return
+        }
 
         if (!response.ok) {
           throw new Error('Unable to load graph')
@@ -306,6 +493,11 @@ function App() {
           },
         })
 
+        if (response.status === 401) {
+          expireSession()
+          return
+        }
+
         if (!response.ok) {
           throw new Error('Unable to load document')
         }
@@ -326,7 +518,13 @@ function App() {
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
-      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 's') {
+      const isSaveShortcut =
+        (event.ctrlKey || event.metaKey) &&
+        (event.key.toLowerCase() === 's' ||
+          event.key.toLowerCase() === 'ы' ||
+          event.code === 'KeyS')
+
+      if (!isSaveShortcut) {
         return
       }
 
@@ -350,6 +548,20 @@ function App() {
       window.removeEventListener('keydown', handleKeyDown)
     }
   }, [edges, nodes, sections, session, workspaceMode])
+
+  useLayoutEffect(() => {
+    document.querySelectorAll<HTMLTextAreaElement>('.auto-textarea').forEach(resizeTextarea)
+  }, [selectedSectionId, selectedSectionBlocks])
+
+  useLayoutEffect(() => {
+    if (!focusBlockId) {
+      return
+    }
+
+    const editor = document.querySelector<HTMLElement>(`[data-block-id="${focusBlockId}"]`)
+    editor?.focus()
+    setFocusBlockId(null)
+  }, [focusBlockId, selectedSectionBlocks])
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -375,11 +587,13 @@ function App() {
       }
 
       const data = (await response.json()) as LoginResponse
-
-      setSession({
+      const nextSession = {
         username: login,
         token: data.token,
-      })
+      }
+
+      localStorage.setItem(sessionStorageKey, JSON.stringify(nextSession))
+      setSession(nextSession)
       setLoginState('success')
       setMessage('Signed in')
     } catch {
@@ -389,6 +603,7 @@ function App() {
   }
 
   function handleSignOut() {
+    localStorage.removeItem(sessionStorageKey)
     setSession(null)
     setLoginState('idle')
     setSaveState('idle')
@@ -398,6 +613,7 @@ function App() {
     setSelectedNodeIds([])
     setSelectedEdgeId(null)
     setSelectedSectionId(null)
+    setEditingSectionId(null)
     setDocBlocksBySectionId({})
   }
 
@@ -465,7 +681,7 @@ function App() {
   }
 
   function handleCanvasPointerDown(event: PointerEvent<SVGSVGElement>) {
-    if (event.button !== 2 || event.target !== canvasRef.current) {
+    if (event.button !== 0 || event.target !== canvasRef.current) {
       return
     }
 
@@ -660,23 +876,27 @@ function App() {
     updateSelectedSectionContent(serializeMarkdownBlocks(blocks))
   }
 
-  function addContentBlock(type: DocBlockType, value?: string) {
+  function createContentBlock(type: DocBlockType, value?: string): DocBlock {
     const initialValueByType: Record<DocBlockType, string> = {
       text: '',
-      heading: 'Heading',
+      heading: '',
       image: '',
       code: '',
       quote: '',
     }
 
-    updateSelectedSectionBlocks([
-      ...selectedSectionBlocks,
-      {
-        id: createId(),
-        type,
-        value: value ?? initialValueByType[type],
-      },
-    ])
+    return {
+      id: createId(),
+      type,
+      value: value ?? initialValueByType[type],
+      font: type === 'text' ? 'default' : undefined,
+    }
+  }
+
+  function requestImageForBlock(blockId: string) {
+    setPendingImageBlockId(blockId)
+    setPendingImageInsertIndex(null)
+    imageInputRef.current?.click()
   }
 
   async function handleNewImageFile(file: File) {
@@ -684,18 +904,128 @@ function App() {
       return
     }
 
-    const blockId = createId()
-    const nextBlocks: DocBlock[] = [
-      ...selectedSectionBlocks,
-      {
-        id: blockId,
-        type: 'image',
-        value: '',
-      },
-    ]
+    const blockId = pendingImageBlockId ?? createId()
+    let nextBlocks: DocBlock[]
+
+    if (pendingImageBlockId) {
+      nextBlocks = selectedSectionBlocks.map((block) =>
+        block.id === pendingImageBlockId ? { ...block, type: 'image', value: '', font: undefined } : block,
+      )
+    } else {
+      const insertIndex = pendingImageInsertIndex ?? selectedSectionBlocks.length
+      nextBlocks = [...selectedSectionBlocks]
+      nextBlocks.splice(insertIndex, 0, createContentBlock('image'))
+      nextBlocks[insertIndex] = { ...nextBlocks[insertIndex], id: blockId }
+    }
 
     updateSelectedSectionBlocks(nextBlocks)
+    setPendingImageInsertIndex(null)
+    setPendingImageBlockId(null)
     await uploadImageBlock(blockId, file, nextBlocks)
+  }
+
+  function transformContentBlock(blockId: string, type: DocBlockType) {
+    const currentBlock = selectedSectionBlocks.find((block) => block.id === blockId)
+    const cleanedValue = currentBlock?.value.trim() === '/' ? '' : currentBlock?.value.replace(/\/$/, '') ?? ''
+
+    setSlashMenuBlockId(null)
+
+    if (type === 'image') {
+      updateSelectedSectionBlocks(
+        selectedSectionBlocks.map((block) =>
+          block.id === blockId ? { ...block, type: 'image', value: '', font: undefined } : block,
+        ),
+      )
+      requestImageForBlock(blockId)
+      return
+    }
+
+    updateSelectedSectionBlocks(
+      selectedSectionBlocks.map((block) =>
+        block.id === blockId
+          ? {
+              ...block,
+              type,
+              value: cleanedValue,
+              font: type === 'text' ? (block.font ?? 'default') : undefined,
+            }
+          : block,
+      ),
+    )
+  }
+
+  function handleEditableBlockChange(
+    event: ChangeEvent<HTMLTextAreaElement | HTMLInputElement>,
+    block: DocBlock,
+  ) {
+    const value = event.target.value
+    const shouldOpenSlashMenu = block.type === 'text' && value.endsWith('/')
+
+    if ('currentTarget' in event && event.currentTarget instanceof HTMLTextAreaElement) {
+      resizeTextarea(event.currentTarget)
+    }
+
+    setSlashMenuBlockId(shouldOpenSlashMenu ? block.id : null)
+    updateContentBlock(block.id, value)
+  }
+
+  function handleEmptyEditorChange(event: ChangeEvent<HTMLTextAreaElement>) {
+    const value = event.target.value
+    const block = createContentBlock('text', value)
+
+    resizeTextarea(event.currentTarget)
+    updateSelectedSectionBlocks([block])
+    setSlashMenuBlockId(value.endsWith('/') ? block.id : null)
+    setFocusBlockId(block.id)
+  }
+
+  function insertTextBlockAfter(blockId: string) {
+    const blockIndex = selectedSectionBlocks.findIndex((block) => block.id === blockId)
+
+    if (blockIndex < 0) {
+      return
+    }
+
+    const nextBlock = createContentBlock('text')
+    const nextBlocks = [...selectedSectionBlocks]
+    nextBlocks.splice(blockIndex + 1, 0, nextBlock)
+    updateSelectedSectionBlocks(nextBlocks)
+    setSlashMenuBlockId(null)
+    setFocusBlockId(nextBlock.id)
+  }
+
+  function handleBlockEnter(
+    event: ReactKeyboardEvent<HTMLInputElement | HTMLTextAreaElement>,
+    blockId: string,
+  ) {
+    if (event.key !== 'Enter' || event.shiftKey) {
+      return
+    }
+
+    event.preventDefault()
+    insertTextBlockAfter(blockId)
+  }
+
+  function renderSlashMenu(blockId: string) {
+    if (slashMenuBlockId !== blockId) {
+      return null
+    }
+
+    return (
+      <div className="slash-menu" onMouseDown={(event) => event.preventDefault()}>
+        {slashCommands.map((command) => (
+          <button
+            className="slash-command"
+            key={command.type}
+            type="button"
+            onClick={() => transformContentBlock(blockId, command.type)}
+          >
+            <span className="slash-command-label">{command.label}</span>
+            <span className="slash-command-hint">{command.hint}</span>
+          </button>
+        ))}
+      </div>
+    )
   }
 
   function updateContentBlock(blockId: string, value: string) {
@@ -855,14 +1185,39 @@ function App() {
           style={{ '--section-depth': level } as CSSProperties}
           onClick={() => setSelectedSectionId(section.id)}
         >
-          <input
-            className="doc-tree-input"
-            value={section.title}
-            aria-label="Chapter title"
-            placeholder="Untitled"
-            onChange={(event) => updateSectionTitle(section.id, event.target.value)}
-            onFocus={() => setSelectedSectionId(section.id)}
-          />
+          {editingSectionId === section.id ? (
+            <input
+              className="doc-tree-input"
+              value={section.title}
+              aria-label="Chapter title"
+              autoFocus
+              placeholder="Untitled"
+              onBlur={() => setEditingSectionId(null)}
+              onChange={(event) => updateSectionTitle(section.id, event.target.value)}
+              onFocus={() => setSelectedSectionId(section.id)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === 'Escape') {
+                  setEditingSectionId(null)
+                }
+              }}
+            />
+          ) : (
+            <>
+              <span className="doc-tree-title">{section.title || 'Untitled'}</span>
+              <button
+                className="doc-title-edit-button"
+                type="button"
+                aria-label="Edit chapter title"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setSelectedSectionId(section.id)
+                  setEditingSectionId(section.id)
+                }}
+              >
+                ✎
+              </button>
+            </>
+          )}
         </div>
         {section.children.length > 0 && renderSectionTree(section.children, level + 1)}
       </div>
@@ -1109,101 +1464,138 @@ function App() {
                           <p className="profile-label">Editing</p>
                           <h2>{selectedSection.title || 'Untitled'}</h2>
                         </div>
-                        <div className="block-toolbar" aria-label="Add content block">
-                          <span>+</span>
-                          <button type="button" onClick={() => addContentBlock('text')}>
-                            Text
-                          </button>
-                          <button type="button" onClick={() => addContentBlock('heading')}>
-                            Heading
-                          </button>
-                          <button type="button" onClick={() => imageInputRef.current?.click()}>
-                            Image
-                          </button>
-                          <input
-                            ref={imageInputRef}
-                            type="file"
-                            accept="image/*"
-                            hidden
-                            onChange={(event) => {
-                              const file = event.target.files?.[0]
+                        <input
+                          ref={imageInputRef}
+                          type="file"
+                          accept="image/*"
+                          hidden
+                          onChange={(event) => {
+                            const file = event.target.files?.[0]
 
-                              if (file) {
-                                handleNewImageFile(file)
-                              }
+                            if (file) {
+                              handleNewImageFile(file)
+                            }
 
-                              event.target.value = ''
-                            }}
-                          />
-                          <button type="button" onClick={() => addContentBlock('code')}>
-                            Code
-                          </button>
-                          <button type="button" onClick={() => addContentBlock('quote')}>
-                            Quote
-                          </button>
-                        </div>
+                            event.target.value = ''
+                          }}
+                        />
                       </div>
 
                       <div className="content-blocks">
                         {selectedSectionBlocks.length > 0 ? (
-                          selectedSectionBlocks.map((block) => (
-                            <div className="content-block" key={block.id}>
-                              <div className="content-block-header">
-                                <button
-                                  className="secondary-button"
-                                  type="button"
-                                  onClick={() => removeContentBlock(block.id)}
-                                >
-                                  Remove
-                                </button>
-                              </div>
+                          <>
+                            {selectedSectionBlocks.map((block) => (
+                              <div className="block-with-divider" key={block.id}>
+                                <div className={`content-block ${block.type}-block`}>
+                                  <button
+                                    className="block-remove-button"
+                                    type="button"
+                                    aria-label="Remove block"
+                                    onClick={() => removeContentBlock(block.id)}
+                                  >
+                                    ×
+                                  </button>
 
-                              {block.type === 'heading' && (
-                                <input
-                                  type="text"
-                                  value={block.value}
-                                  placeholder="Heading"
-                                  onChange={(event) => updateContentBlock(block.id, event.target.value)}
-                                />
-                              )}
+                                  {block.type === 'heading' && (
+                                    <input
+                                      className="heading-input"
+                                      data-block-id={block.id}
+                                      type="text"
+                                      value={block.value}
+                                      placeholder="Heading 1"
+                                      onKeyDown={(event) => handleBlockEnter(event, block.id)}
+                                      onChange={(event) => handleEditableBlockChange(event, block)}
+                                    />
+                                  )}
 
-                              {block.type === 'image' && (
-                                <div className="image-block-editor">
-                                  <input
-                                    type="text"
-                                    value={block.value}
-                                    placeholder="assets/image.png"
-                                    onChange={(event) => updateContentBlock(block.id, event.target.value)}
-                                  />
-                                  {block.value && (
-                                    <img
-                                      className="image-preview"
-                                      src={getImagePreviewUrl(documentName, selectedSectionId, block.value)}
-                                      alt=""
+                                  {block.type === 'image' && (
+                                    <div className="image-block-editor">
+                                      {block.value && (
+                                        <img
+                                          className="image-preview"
+                                          src={getImagePreviewUrl(documentName, selectedSectionId, block.value)}
+                                          alt=""
+                                        />
+                                      )}
+                                    </div>
+                                  )}
+
+                                  {block.type === 'code' && (
+                                    <div className="code-editor">
+                                      <button
+                                        className="code-copy-button"
+                                        type="button"
+                                        onClick={() => {
+                                          navigator.clipboard.writeText(block.value)
+                                          setDocMessage('Code copied')
+                                        }}
+                                      >
+                                        Copy
+                                      </button>
+                                      <pre className="code-highlight" aria-hidden="true">
+                                        <code>{highlightCode(block.value)}</code>
+                                      </pre>
+                                      <textarea
+                                        className="code-input auto-textarea"
+                                        value={block.value}
+                                        placeholder="Code"
+                                        spellCheck={false}
+                                        onChange={(event) => {
+                                          resizeTextarea(event.currentTarget)
+                                          updateContentBlock(block.id, event.target.value)
+                                        }}
+                                      />
+                                    </div>
+                                  )}
+
+                                  {block.type === 'text' && (
+                                    <div className="markdown-block-editor">
+                                      <textarea
+                                        data-block-id={block.id}
+                                        className="auto-textarea markdown-source"
+                                        value={block.value}
+                                        placeholder="Type / for commands"
+                                        onBlur={() => setSlashMenuBlockId(null)}
+                                        onKeyDown={(event) => {
+                                          if (event.key === 'Escape') {
+                                            setSlashMenuBlockId(null)
+                                          }
+
+                                          handleBlockEnter(event, block.id)
+                                        }}
+                                        onChange={(event) => {
+                                          handleEditableBlockChange(event, block)
+                                        }}
+                                      />
+                                      {renderSlashMenu(block.id)}
+                                    </div>
+                                  )}
+
+                                  {block.type === 'quote' && (
+                                    <textarea
+                                      className="auto-textarea"
+                                      value={block.value}
+                                      placeholder="Quote"
+                                      onChange={(event) => {
+                                        resizeTextarea(event.currentTarget)
+                                        updateContentBlock(block.id, event.target.value)
+                                      }}
                                     />
                                   )}
                                 </div>
-                              )}
-
-                              {(block.type === 'text' || block.type === 'quote' || block.type === 'code') && (
-                                <textarea
-                                  value={block.value}
-                                  placeholder={
-                                    block.type === 'code'
-                                      ? 'Code'
-                                      : block.type === 'quote'
-                                        ? 'Quote'
-                                        : 'Text'
-                                  }
-                                  onChange={(event) => updateContentBlock(block.id, event.target.value)}
-                                />
-                              )}
-                            </div>
-                          ))
+                              </div>
+                            ))}
+                          </>
                         ) : (
-                          <div className="empty-doc-state">
-                            <h2>No blocks yet</h2>
-                            <p>Use the plus controls to add content.</p>
+                          <div className="content-block text-block">
+                            <div className="markdown-block-editor">
+                              <textarea
+                                data-block-id="empty-doc-editor"
+                                className="auto-textarea markdown-source"
+                                placeholder="Type / for commands"
+                                onChange={handleEmptyEditorChange}
+                              />
+                            </div>
                           </div>
                         )}
                       </div>
