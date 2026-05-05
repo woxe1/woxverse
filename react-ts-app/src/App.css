@@ -423,6 +423,13 @@
   padding: 18px 18px 12px;
 }
 
+.docs-sidebar-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
 .docs-sidebar h2,
 .empty-doc-state h2 {
   margin: 0;
@@ -513,6 +520,7 @@
   color: var(--text-h);
 }
 
+.doc-title-add-button,
 .doc-title-edit-button {
   display: grid;
   place-items: center;
@@ -528,12 +536,25 @@
   opacity: 0;
 }
 
+.doc-title-add-button.root {
+  opacity: 1;
+}
+
+.doc-tree-row:hover .doc-title-add-button,
+.doc-tree-row.selected .doc-title-add-button,
 .doc-tree-row:hover .doc-title-edit-button,
 .doc-tree-row.selected .doc-title-edit-button,
 .doc-tree-row:hover .doc-title-delete-button,
 .doc-tree-row.selected .doc-title-delete-button,
+.doc-title-add-button:focus-visible,
 .doc-title-edit-button:focus-visible {
   opacity: 1;
+}
+
+.doc-title-add-button:hover {
+  border-color: rgba(88, 228, 181, 0.28);
+  color: #58e4b5;
+  filter: none;
 }
 
 .doc-title-edit-button:hover {
@@ -1072,6 +1093,25 @@
 
 .markdown-source:focus {
   box-shadow: none !important;
+}
+
+.trailing-placeholder-button {
+  display: block;
+  width: 100%;
+  min-height: 32px !important;
+  padding: 0 !important;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  line-height: 1.6;
+  text-align: left;
+}
+
+.trailing-placeholder-button:hover,
+.trailing-placeholder-button:focus-visible {
+  color: var(--text);
+  filter: none;
 }
 
 .slash-menu {

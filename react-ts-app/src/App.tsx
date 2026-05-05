@@ -1432,15 +1432,13 @@ function App() {
     updateContentBlock(block.id, value)
   }
 
-  function handlePlaceholderEditorChange(event: ChangeEvent<HTMLTextAreaElement>) {
-    const value = event.target.value
-    const block = createContentBlock('text', value)
+  function appendTrailingTextBlock() {
+    const block = createContentBlock('text')
     const nextBlocks =
       selectedSectionBlocks.length > 0 ? [...selectedSectionBlocks, block] : [block]
 
-    resizeTextarea(event.currentTarget)
     updateSelectedSectionBlocks(nextBlocks)
-    setSlashMenuBlockId(value.endsWith('/') ? block.id : null)
+    setSlashMenuBlockId(null)
     setSlashMenuIndex(0)
     setFocusBlockId(block.id)
   }
@@ -1480,7 +1478,7 @@ function App() {
     }
 
     if (direction > 0 && shouldRenderTrailingPlaceholder) {
-      setFocusBlockId('empty-doc-editor')
+      appendTrailingTextBlock()
       return true
     }
 
@@ -1673,23 +1671,13 @@ function App() {
 
     return (
       <div className="content-block text-block trailing-placeholder-block">
-        <div className="markdown-block-editor">
-          <textarea
-            data-block-id="empty-doc-editor"
-            className="auto-textarea markdown-source"
-            placeholder="Type / for commands"
-            onBlur={() => {
-              setSlashMenuBlockId(null)
-              setSlashMenuIndex(0)
-            }}
-            onKeyDown={(event) => {
-              if (slashMenuBlockId && handleSlashMenuKeyDown(event, slashMenuBlockId)) {
-                return
-              }
-            }}
-            onChange={handlePlaceholderEditorChange}
-          />
-        </div>
+        <button
+          className="trailing-placeholder-button"
+          type="button"
+          onClick={appendTrailingTextBlock}
+        >
+          Type / for commands
+        </button>
       </div>
     )
   }
@@ -1967,6 +1955,18 @@ function App() {
             <>
               <span className="doc-tree-title">{section.title || 'Untitled'}</span>
               <button
+                className="doc-title-add-button"
+                type="button"
+                aria-label="Add subchapter"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setSelectedSectionId(section.id)
+                  addSection(section.id)
+                }}
+              >
+                +
+              </button>
+              <button
                 className="doc-title-edit-button"
                 type="button"
                 aria-label="Edit chapter title"
@@ -2205,17 +2205,6 @@ function App() {
           {workspaceMode === 'docs' && (
             <>
               <div className="toolbar">
-                <button type="button" onClick={() => addSection()}>
-                  Add chapter
-                </button>
-                <button
-                  className="secondary-button"
-                  type="button"
-                  disabled={!selectedSection}
-                  onClick={() => selectedSection && addSection(selectedSection.id)}
-                >
-                  Add subchapter
-                </button>
                 <button className="secondary-button" type="button" onClick={() => saveDocument()}>
                   {docSaveState === 'loading' ? 'Saving...' : 'Save'}
                 </button>
@@ -2224,7 +2213,17 @@ function App() {
               <div className="docs-layout">
                 <aside className="docs-sidebar" aria-label="Documentation chapters">
                   <div className="docs-sidebar-header">
-                    <h2>Chapters</h2>
+                    <div className="docs-sidebar-title-row">
+                      <h2>Chapters</h2>
+                      <button
+                        className="doc-title-add-button root"
+                        type="button"
+                        aria-label="Add chapter"
+                        onClick={() => addSection()}
+                      >
+                        +
+                      </button>
+                    </div>
                     <input
                       className="section-search-input"
                       type="search"
