@@ -24,6 +24,8 @@ app = FastAPI(title="Auth Service")
 
 database_path = Path(os.getenv("SQLITE_PATH", "/data/graphs.sqlite"))
 documents_path = Path(os.getenv("DOCUMENTS_PATH", "/data/documents"))
+local_document_root = os.getenv("WOXVERSE_LOCAL_DOCUMENT_ROOT", "").lower() in {"1", "true", "yes"}
+local_mode = os.getenv("WOXVERSE_LOCAL_MODE", "").lower() in {"1", "true", "yes"}
 
 app.add_middleware(
     CORSMiddleware,
@@ -136,7 +138,7 @@ def init_database() -> None:
 
 
 def get_document_directory(document_name: str) -> Path:
-    document_directory = documents_path / document_name
+    document_directory = documents_path if local_document_root and document_name == "default" else documents_path / document_name
     document_directory.mkdir(parents=True, exist_ok=True)
     return document_directory
 
@@ -185,7 +187,13 @@ def scan_document_sections(parent_directory: Path) -> list[DocSection]:
     sections: list[DocSection] = []
 
     for section_directory in sorted(
-        [path for path in parent_directory.iterdir() if path.is_dir() and path.name != "assets"],
+        [
+            path
+            for path in parent_directory.iterdir()
+            if path.is_dir()
+            and path.name != "assets"
+            and parse_section_directory_name(path)[0] != 9999
+        ],
         key=lambda path: parse_section_directory_name(path)[0],
     ):
         _, title, section_id = parse_section_directory_name(section_directory)
@@ -248,16 +256,30 @@ def write_markdown_files(
 def remove_stale_markdown_files(document_name: str, active_paths: set[Path]) -> None:
     document_directory = get_document_directory(document_name)
 
-    for markdown_file in sorted(document_directory.rglob("*.md"), reverse=True):
-        if markdown_file not in active_paths:
-            markdown_file.unlink()
+    def remove_stale_in_directory(directory: Path) -> None:
+        for markdown_file in sorted(directory.glob("*.md"), reverse=True):
+            if markdown_file not in active_paths:
+                markdown_file.unlink()
 
-    for directory in sorted(document_directory.rglob("*"), key=lambda path: len(path.parts), reverse=True):
-        if directory.is_dir() and directory not in active_paths and not any(directory.iterdir()):
-            directory.rmdir()
+        section_directories = [
+            child
+            for child in directory.iterdir()
+            if child.is_dir() and parse_section_directory_name(child)[0] != 9999
+        ]
+
+        for section_directory in sorted(section_directories, key=lambda path: len(path.parts), reverse=True):
+            remove_stale_in_directory(section_directory)
+
+            if section_directory not in active_paths and not any(section_directory.iterdir()):
+                section_directory.rmdir()
+
+    remove_stale_in_directory(document_directory)
 
 
 def require_token(authorization: Annotated[str | None, Header()] = None) -> None:
+    if local_mode:
+        return
+
     if authorization != "Bearer hardcoded-token":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -266,6 +288,9 @@ def require_token(authorization: Annotated[str | None, Header()] = None) -> None
 
 
 def require_token_value(authorization: str | None) -> None:
+    if local_mode:
+        return
+
     if authorization != "Bearer hardcoded-token":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -323,6 +348,9 @@ def health() -> dict[str, str]:
 
 @app.post("/auth/login", response_model=LoginResponse)
 def login(payload: LoginRequest) -> LoginResponse:
+    if local_mode:
+        return LoginResponse(authenticated=True, token="hardcoded-token")
+
     expected_login = os.getenv("AUTH_LOGIN", "")
     expected_password = os.getenv("AUTH_PASSWORD", "")
 

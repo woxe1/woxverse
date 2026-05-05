@@ -27,6 +27,10 @@
   overflow: hidden;
 }
 
+.backend-panel {
+  width: min(100%, 460px);
+}
+
 .auth-panel::before,
 .dashboard-panel::before,
 .workspace-panel::before {
@@ -144,6 +148,69 @@
 .mode-tabs button.active {
   background: var(--surface);
   color: var(--text-h);
+}
+
+.backend-mode-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--input-bg);
+}
+
+.backend-mode-tabs button {
+  min-height: 38px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+}
+
+.backend-mode-tabs button.active {
+  background: var(--surface);
+  color: var(--text-h);
+}
+
+.directory-picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.directory-picker button {
+  min-height: 48px;
+  padding: 0 14px;
+  border: 1px solid var(--border);
+  background: var(--input-bg);
+  color: var(--text-h);
+}
+
+.local-project-list {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.local-project-button {
+  display: grid;
+  justify-items: start;
+  min-height: 58px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  background: var(--input-bg);
+  color: var(--text-h);
+  text-align: left;
+}
+
+.local-project-button small {
+  width: 100%;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .status-dot {
@@ -963,6 +1030,201 @@
   overflow-wrap: anywhere;
 }
 
+.diagram-block {
+  padding: 12px;
+  border-left: 3px solid #a78bfa;
+  border-radius: 8px;
+  background: #0b0a13;
+}
+
+.diagram-editor {
+  display: grid;
+  gap: 10px;
+}
+
+.diagram-preview {
+  position: relative;
+  width: 100%;
+  height: 360px;
+  border: 1px solid #27213f;
+  border-radius: 8px;
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+    #070711;
+  background-size: 24px 24px;
+  touch-action: none;
+  overflow: hidden;
+}
+
+.diagram-preview-flow {
+  pointer-events: none;
+}
+
+.diagram-edit-button {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  min-height: 32px !important;
+  padding: 0 !important;
+  border: 1px solid #33265d;
+  border-radius: 999px;
+  background: #121024;
+  color: #ddd6fe;
+  font-size: 15px !important;
+  opacity: 0;
+  transition: opacity 0.16s;
+}
+
+.diagram-preview:hover .diagram-edit-button,
+.diagram-edit-button:focus-visible {
+  opacity: 1;
+}
+
+.diagram-edit-button:hover {
+  border-color: #a78bfa;
+  filter: none;
+}
+
+.diagram-preview .react-flow__node-diagram,
+.diagram-modal-canvas .react-flow__node-diagram {
+  min-width: 140px;
+  border: 0;
+  background: transparent;
+  color: var(--text-h);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.diagram-preview .react-flow__node-diagram.selected .diagram-flow-node,
+.diagram-modal-canvas .react-flow__node-diagram.selected .diagram-flow-node {
+  border-color: #a78bfa;
+  box-shadow: 0 0 0 2px rgba(167, 139, 250, 0.22);
+}
+
+.diagram-flow-node {
+  position: relative;
+  display: grid;
+  place-items: center;
+  min-width: 140px;
+  min-height: 56px;
+  padding: 10px 16px;
+  border: 1px solid #5b4aa0;
+  border-radius: 8px;
+  background: #14142a;
+}
+
+.diagram-flow-node span {
+  max-width: 180px;
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.diagram-handle {
+  width: 10px;
+  height: 10px;
+  border: 2px solid #070711;
+  background: #a78bfa;
+}
+
+.diagram-handle.left {
+  left: -6px;
+}
+
+.diagram-handle.right {
+  right: -6px;
+}
+
+.diagram-handle.top {
+  top: -6px;
+}
+
+.diagram-handle.bottom {
+  bottom: -6px;
+}
+
+.diagram-handle.source {
+  background: #24d3ee;
+}
+
+.diagram-handle.left.source {
+  left: 6px;
+}
+
+.diagram-handle.right.source {
+  right: 6px;
+}
+
+.diagram-handle.top.source {
+  top: 6px;
+}
+
+.diagram-handle.bottom.source {
+  bottom: 6px;
+}
+
+.diagram-preview .diagram-handle {
+  opacity: 0;
+}
+
+.diagram-preview .react-flow__edge-path,
+.diagram-modal-canvas .react-flow__edge-path {
+  stroke: #9ca3af;
+  stroke-width: 2;
+}
+
+.diagram-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: #05070c;
+}
+
+.diagram-modal-toolbar {
+  display: grid;
+  grid-template-columns: auto auto minmax(180px, 360px) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 12px;
+  border-bottom: 1px solid #27213f;
+  background: #090916;
+}
+
+.diagram-modal-toolbar button {
+  min-height: 34px !important;
+  padding: 0 12px !important;
+  border: 1px solid #33265d;
+  background: #121024;
+  color: #ddd6fe;
+  font-size: 12px !important;
+}
+
+.diagram-modal-toolbar input {
+  min-height: 34px !important;
+  padding: 0 12px !important;
+  border: 1px solid #33265d !important;
+  border-radius: 6px !important;
+  background: #05070c !important;
+  color: var(--text-h) !important;
+}
+
+.diagram-modal-canvas {
+  min-height: 0;
+}
+
+.diagram-modal-canvas .react-flow {
+  background: #070711;
+}
+
 .code-editor {
   position: relative;
   min-height: 180px;
@@ -1317,7 +1579,9 @@
 }
 
 .login-form input[type='email'],
-.login-form input[type='password'] {
+.login-form input[type='password'],
+.login-form input[type='url'],
+.login-form input[type='text'] {
   width: 100%;
   min-height: 48px;
   padding: 0 15px;

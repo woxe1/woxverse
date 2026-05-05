@@ -1,5 +1,23 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { FitAddon } from '@xterm/addon-fit'
+import {
+  Background,
+  Controls,
+  Handle,
+  MarkerType,
+  MiniMap,
+  Position,
+  ReactFlow,
+  addEdge,
+  applyEdgeChanges,
+  applyNodeChanges,
+  type Connection,
+  type Edge as FlowEdge,
+  type Node as FlowNode,
+  type OnConnect,
+  type OnEdgesChange,
+  type OnNodesChange,
+} from '@xyflow/react'
 import type {
   CSSProperties,
   ChangeEvent,
@@ -11,11 +29,13 @@ import type {
 } from 'react'
 import { Terminal } from 'xterm'
 import './App.css'
+import '@xyflow/react/dist/style.css'
 import 'xterm/css/xterm.css'
 
 type LoginState = 'idle' | 'loading' | 'success' | 'error'
 type SaveState = 'idle' | 'loading' | 'success' | 'error'
 type WorkspaceMode = 'graph' | 'docs'
+type BackendMode = 'remote' | 'local'
 
 type LoginResponse = {
   authenticated: boolean
@@ -25,6 +45,21 @@ type LoginResponse = {
 type UserSession = {
   username: string
   token: string
+}
+
+type BackendConfig = {
+  mode: BackendMode
+  apiUrl: string
+  projectsPath?: string
+  activeProjectId?: string
+  activeProjectName?: string
+  activeProjectPath?: string
+}
+
+type LocalProject = {
+  id: string
+  name: string
+  path: string
 }
 
 type GraphNode = {
@@ -69,7 +104,7 @@ type SectionOption = {
   depth: number
 }
 
-type DocBlockType = 'text' | 'heading' | 'image' | 'code' | 'quote' | 'playground' | 'terminal'
+type DocBlockType = 'text' | 'heading' | 'image' | 'code' | 'quote' | 'playground' | 'terminal' | 'diagram'
 type TextFont = 'default' | 'serif' | 'mono' | 'display'
 
 type DocBlock = {
@@ -120,7 +155,49 @@ type PanDrag = {
   originY: number
 }
 
-const apiUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
+type DiagramNode = {
+  id: string
+  label: string
+  x: number
+  y: number
+}
+
+type DiagramEdge = {
+  id: string
+  source: string
+  target: string
+  sourceHandle?: string | null
+  targetHandle?: string | null
+}
+
+type DiagramData = {
+  nodes: DiagramNode[]
+  edges: DiagramEdge[]
+}
+
+declare global {
+  interface Window {
+    woxverseDesktop?: {
+      platform: string
+      getBackendConfig: () => Promise<BackendConfig | null>
+      saveBackendConfig: (config: BackendConfig) => Promise<BackendConfig>
+      selectProjectsDirectory: () => Promise<string | null>
+      listLocalProjects: (projectsPath: string) => Promise<LocalProject[]>
+      createLocalProject: (projectsPath: string, projectName: string) => Promise<LocalProject>
+      loadLocalDocument: (projectsPath: string) => Promise<DocumentData>
+      saveLocalDocument: (projectsPath: string, document: DocumentData) => Promise<DocumentData>
+      saveLocalDocumentAsset: (
+        projectPath: string,
+        sectionId: string,
+        filename: string,
+        arrayBuffer: ArrayBuffer,
+      ) => Promise<AssetUploadResponse>
+    }
+  }
+}
+
+const defaultApiUrl = import.meta.env.VITE_API_URL ?? 'http://localhost:8000'
+const backendConfigStorageKey = 'woxverse-backend-config'
 const graphName = 'default'
 const documentName = 'default'
 const sessionStorageKey = 'woxverse-session'
@@ -135,6 +212,7 @@ const slashCommands: SlashCommand[] = [
   { type: 'heading', label: 'H1', hint: 'Large section heading' },
   { type: 'image', label: 'Image', hint: 'Upload and insert a photo' },
   { type: 'code', label: 'Code', hint: 'Highlighted code block' },
+  { type: 'diagram', label: 'Diagram', hint: 'Draw boxes and links' },
   { type: 'playground', label: 'Playground', hint: 'Run Python code inline' },
   { type: 'terminal', label: 'Terminal', hint: 'Open an SSH terminal' },
   { type: 'quote', label: 'Quote', hint: 'Callout quote text' },
@@ -142,6 +220,44 @@ const slashCommands: SlashCommand[] = [
 
 function createId(): string {
   return crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`
+}
+
+function normalizeApiUrl(value: string): string {
+  const trimmedValue = value.trim()
+
+  if (!trimmedValue) {
+    return defaultApiUrl
+  }
+
+  return trimmedValue.replace(/\/+$/, '')
+}
+
+function normalizeBackendConfig(config: Partial<BackendConfig> | null | undefined): BackendConfig {
+  if (config?.mode === 'local') {
+    return {
+      mode: 'local',
+      apiUrl: normalizeApiUrl(config.apiUrl ?? defaultApiUrl),
+      projectsPath: config.projectsPath,
+      activeProjectId: config.activeProjectId,
+      activeProjectName: config.activeProjectName,
+      activeProjectPath: config.activeProjectPath,
+    }
+  }
+
+  return {
+    mode: 'remote',
+    apiUrl: normalizeApiUrl(config?.apiUrl ?? defaultApiUrl),
+  }
+}
+
+function loadStoredBackendConfig(): BackendConfig | null {
+  try {
+    const storedConfig = localStorage.getItem(backendConfigStorageKey)
+    return storedConfig ? normalizeBackendConfig(JSON.parse(storedConfig) as Partial<BackendConfig>) : null
+  } catch {
+    localStorage.removeItem(backendConfigStorageKey)
+    return null
+  }
 }
 
 function findSection(sections: DocSection[], sectionId: string | null): DocSection | null {
@@ -237,6 +353,52 @@ function parseTerminalBlockConfig(value: string): TerminalBlockConfig {
 
 function stringifyTerminalBlockConfig(config: TerminalBlockConfig): string {
   return JSON.stringify(config, null, 2)
+}
+
+function createDefaultDiagramData(): DiagramData {
+  return {
+    nodes: [
+      { id: createId(), label: 'Start', x: 80, y: 90 },
+      { id: createId(), label: 'Step', x: 300, y: 90 },
+    ],
+    edges: [],
+  }
+}
+
+function parseDiagramData(value: string): DiagramData {
+  if (!value.trim()) {
+    return createDefaultDiagramData()
+  }
+
+  try {
+    const parsed = JSON.parse(value) as Partial<DiagramData>
+
+    return {
+      nodes: Array.isArray(parsed.nodes)
+        ? parsed.nodes.map((node) => ({
+            id: String(node.id || createId()),
+            label: String(node.label || 'Block'),
+            x: Number(node.x || 80),
+            y: Number(node.y || 80),
+          }))
+        : [],
+      edges: Array.isArray(parsed.edges)
+        ? parsed.edges.map((edge) => ({
+            id: String(edge.id || createId()),
+            source: String(edge.source || ''),
+            target: String(edge.target || ''),
+            sourceHandle: typeof edge.sourceHandle === 'string' ? edge.sourceHandle : null,
+            targetHandle: typeof edge.targetHandle === 'string' ? edge.targetHandle : null,
+          }))
+        : [],
+    }
+  } catch {
+    return createDefaultDiagramData()
+  }
+}
+
+function stringifyDiagramData(data: DiagramData): string {
+  return JSON.stringify(data, null, 2)
 }
 
 function getTerminalWebSocketUrl(apiBaseUrl: string, sessionId: string, token: string): string {
@@ -364,6 +526,14 @@ function parseMarkdownBlocks(content: string): DocBlock[] {
           }
         }
 
+        if (trimmedBlock.startsWith('```diagram')) {
+          return {
+            id: createId(),
+            type: 'diagram',
+            value: trimmedBlock.replace(/^```diagram\s*\n?/, '').replace(/\n?```$/, ''),
+          }
+        }
+
         return {
           id: createId(),
           type: 'code',
@@ -413,6 +583,10 @@ function serializeMarkdownBlocks(blocks: DocBlock[]): string {
         return `\`\`\`terminal\n${block.value}\n\`\`\``
       }
 
+      if (block.type === 'diagram') {
+        return `\`\`\`diagram\n${block.value}\n\`\`\``
+      }
+
       if (block.type === 'quote') {
         return block.value
           .split('\n')
@@ -430,7 +604,12 @@ function serializeMarkdownBlocks(blocks: DocBlock[]): string {
     .join('\n\n')
 }
 
-function getImagePreviewUrl(documentName: string, sectionId: string | null, value: string): string {
+function getImagePreviewUrl(
+  apiUrl: string,
+  documentName: string,
+  sectionId: string | null,
+  value: string,
+): string {
   if (!sectionId || !value) {
     return ''
   }
@@ -482,6 +661,19 @@ function buildBlocksBySectionId(sections: DocSection[]): Record<string, DocBlock
       ...buildBlocksBySectionId(section.children),
     }
   }, {})
+}
+
+function applyBlocksToSections(
+  sections: DocSection[],
+  blocksBySectionId: Record<string, DocBlock[]>,
+): DocSection[] {
+  return sections.map((section) => ({
+    ...section,
+    content: blocksBySectionId[section.id]
+      ? serializeMarkdownBlocks(blocksBySectionId[section.id])
+      : section.content,
+    children: applyBlocksToSections(section.children, blocksBySectionId),
+  }))
 }
 
 function updateSectionTree(
@@ -561,14 +753,281 @@ function loadStoredSession(): UserSession | null {
   }
 }
 
+type DiagramBlockProps = {
+  value: string
+  onChange: (value: string) => void
+}
+
+function diagramToFlow(diagram: DiagramData): { nodes: FlowNode[]; edges: FlowEdge[] } {
+  return {
+    nodes: diagram.nodes.map((node) => ({
+      id: node.id,
+      type: 'diagram',
+      position: { x: node.x, y: node.y },
+      data: { label: node.label },
+    })),
+    edges: diagram.edges.map((edge) => ({
+      id: edge.id,
+      source: edge.source,
+      target: edge.target,
+      sourceHandle: edge.sourceHandle ?? undefined,
+      targetHandle: edge.targetHandle ?? undefined,
+      animated: false,
+      markerEnd: {
+        type: MarkerType.ArrowClosed,
+      },
+    })),
+  }
+}
+
+function flowToDiagram(nodes: FlowNode[], edges: FlowEdge[]): DiagramData {
+  return {
+    nodes: nodes.map((node) => ({
+      id: node.id,
+      label: String(node.data?.label ?? 'Block'),
+      x: Math.round(node.position.x),
+      y: Math.round(node.position.y),
+    })),
+    edges: edges
+      .filter((edge) => edge.source && edge.target)
+      .map((edge) => ({
+        id: edge.id,
+        source: edge.source,
+        target: edge.target,
+        sourceHandle: edge.sourceHandle ?? null,
+        targetHandle: edge.targetHandle ?? null,
+      })),
+  }
+}
+
+function DiagramFlowNode({ data }: { data: { label?: string } }) {
+  return (
+    <div className="diagram-flow-node">
+      <Handle className="diagram-handle left" id="left-target" type="target" position={Position.Left} />
+      <Handle className="diagram-handle left source" id="left-source" type="source" position={Position.Left} />
+      <Handle className="diagram-handle top" id="top-target" type="target" position={Position.Top} />
+      <Handle className="diagram-handle top source" id="top-source" type="source" position={Position.Top} />
+      <span>{data.label || 'Block'}</span>
+      <Handle className="diagram-handle right" id="right-target" type="target" position={Position.Right} />
+      <Handle className="diagram-handle right source" id="right-source" type="source" position={Position.Right} />
+      <Handle className="diagram-handle bottom" id="bottom-target" type="target" position={Position.Bottom} />
+      <Handle className="diagram-handle bottom source" id="bottom-source" type="source" position={Position.Bottom} />
+    </div>
+  )
+}
+
+const diagramNodeTypes = {
+  diagram: DiagramFlowNode,
+}
+
+function DiagramBlock({ value, onChange }: DiagramBlockProps) {
+  const diagram = useMemo(() => parseDiagramData(value), [value])
+  const flowDiagram = useMemo(() => diagramToFlow(diagram), [diagram])
+  const [isEditorOpen, setIsEditorOpen] = useState(false)
+  const [nodes, setNodes] = useState<FlowNode[]>(flowDiagram.nodes)
+  const [edges, setEdges] = useState<FlowEdge[]>(flowDiagram.edges)
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(flowDiagram.nodes[0]?.id ?? null)
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null)
+  const selectedNode = nodes.find((node) => node.id === selectedNodeId) ?? null
+  const previewKey = `${nodes.map((node) => `${node.id}:${node.position.x}:${node.position.y}:${node.data?.label}`).join('|')}|${edges.map((edge) => `${edge.id}:${edge.source}:${edge.sourceHandle}:${edge.target}:${edge.targetHandle}`).join('|')}`
+
+  useEffect(() => {
+    if (isEditorOpen) {
+      return
+    }
+
+    queueMicrotask(() => {
+      setNodes(flowDiagram.nodes)
+      setEdges(flowDiagram.edges)
+      setSelectedNodeId(flowDiagram.nodes[0]?.id ?? null)
+    })
+  }, [flowDiagram.edges, flowDiagram.nodes, isEditorOpen])
+
+  function commit(nextNodes = nodes, nextEdges = edges) {
+    onChange(stringifyDiagramData(flowToDiagram(nextNodes, nextEdges)))
+  }
+
+  const handleNodesChange: OnNodesChange = (changes) => {
+    setNodes((currentNodes) => {
+      const nextNodes = applyNodeChanges(changes, currentNodes)
+      commit(nextNodes, edges)
+      return nextNodes
+    })
+  }
+
+  const handleEdgesChange: OnEdgesChange = (changes) => {
+    setEdges((currentEdges) => {
+      const nextEdges = applyEdgeChanges(changes, currentEdges)
+      commit(nodes, nextEdges)
+      return nextEdges
+    })
+  }
+
+  const handleConnect: OnConnect = (connection: Connection) => {
+    setEdges((currentEdges) => {
+      const nextEdges = addEdge(
+        {
+          ...connection,
+          id: createId(),
+          markerEnd: {
+            type: MarkerType.ArrowClosed,
+          },
+        },
+        currentEdges,
+      )
+      commit(nodes, nextEdges)
+      return nextEdges
+    })
+  }
+
+  function addNode() {
+    const node: FlowNode = {
+      id: createId(),
+      type: 'diagram',
+      position: { x: 120 + nodes.length * 32, y: 100 + nodes.length * 24 },
+      data: { label: `Block ${nodes.length + 1}` },
+    }
+    const nextNodes = [...nodes, node]
+    setNodes(nextNodes)
+    setSelectedNodeId(node.id)
+    commit(nextNodes, edges)
+  }
+
+  function deleteSelectedNode() {
+    if (!selectedNodeId) {
+      return
+    }
+
+    const nextNodes = nodes.filter((node) => node.id !== selectedNodeId)
+    const nextEdges = edges.filter((edge) => edge.source !== selectedNodeId && edge.target !== selectedNodeId)
+    setNodes(nextNodes)
+    setEdges(nextEdges)
+    setSelectedNodeId(nextNodes[0]?.id ?? null)
+    commit(nextNodes, nextEdges)
+  }
+
+  function deleteSelectedEdge() {
+    if (!selectedEdgeId) {
+      return
+    }
+
+    const nextEdges = edges.filter((edge) => edge.id !== selectedEdgeId)
+    setEdges(nextEdges)
+    setSelectedEdgeId(null)
+    commit(nodes, nextEdges)
+  }
+
+  function updateSelectedNodeLabel(label: string) {
+    if (!selectedNodeId) {
+      return
+    }
+
+    const nextNodes = nodes.map((node) =>
+      node.id === selectedNodeId ? { ...node, data: { ...node.data, label } } : node,
+    )
+    setNodes(nextNodes)
+    commit(nextNodes, edges)
+  }
+
+  return (
+    <div className="diagram-editor">
+      <div className="diagram-preview">
+        <button
+          className="diagram-edit-button"
+          type="button"
+          aria-label="Edit diagram"
+          title="Edit diagram"
+          onClick={() => setIsEditorOpen(true)}
+        >
+          <span aria-hidden="true">&#9998;</span>
+        </button>
+        <ReactFlow
+          key={previewKey}
+          className="diagram-preview-flow"
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={diagramNodeTypes}
+          fitView
+          fitViewOptions={{ padding: 0.22 }}
+          nodesDraggable={false}
+          nodesConnectable={false}
+          elementsSelectable={false}
+          panOnDrag={false}
+          zoomOnScroll={false}
+          zoomOnPinch={false}
+          preventScrolling={false}
+          proOptions={{ hideAttribution: true }}
+        >
+          <Background />
+        </ReactFlow>
+      </div>
+
+      {isEditorOpen && (
+        <div className="diagram-modal" role="dialog" aria-modal="true">
+          <div className="diagram-modal-toolbar">
+            <button type="button" onClick={addNode}>
+              Add block
+            </button>
+            <button type="button" disabled={!selectedNodeId} onClick={deleteSelectedNode}>
+              Delete
+            </button>
+            <button type="button" disabled={!selectedEdgeId} onClick={deleteSelectedEdge}>
+              Delete link
+            </button>
+            <input
+              type="text"
+              value={selectedNode?.data?.label ? String(selectedNode.data.label) : ''}
+              placeholder="Block label"
+              disabled={!selectedNode}
+              onChange={(event) => updateSelectedNodeLabel(event.target.value)}
+            />
+            <button type="button" onClick={() => setIsEditorOpen(false)}>
+              Close
+            </button>
+          </div>
+          <div className="diagram-modal-canvas">
+            <ReactFlow
+              nodes={nodes}
+              edges={edges}
+              nodeTypes={diagramNodeTypes}
+              onNodesChange={handleNodesChange}
+              onEdgesChange={handleEdgesChange}
+              onConnect={handleConnect}
+              onNodeClick={(_event, node) => {
+                setSelectedNodeId(node.id)
+                setSelectedEdgeId(null)
+              }}
+              onEdgeClick={(_event, edge) => {
+                setSelectedEdgeId(edge.id)
+                setSelectedNodeId(null)
+              }}
+              onPaneClick={() => {
+                setSelectedNodeId(null)
+                setSelectedEdgeId(null)
+              }}
+              deleteKeyCode={['Delete', 'Backspace']}
+              fitView
+            >
+              <Background />
+              <MiniMap />
+              <Controls />
+            </ReactFlow>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
 type TerminalBlockProps = {
+  apiUrl: string
   blockId: string
   value: string
   session: UserSession | null
   onChange: (value: string) => void
 }
 
-function TerminalBlock({ blockId, value, session, onChange }: TerminalBlockProps) {
+function TerminalBlock({ apiUrl, blockId, value, session, onChange }: TerminalBlockProps) {
   const config = useMemo(() => parseTerminalBlockConfig(value), [value])
   const [connectionState, setConnectionState] = useState<'idle' | 'opening' | 'open'>('idle')
   const [connectionMessage, setConnectionMessage] = useState('')
@@ -635,7 +1094,7 @@ function TerminalBlock({ blockId, value, session, onChange }: TerminalBlockProps
         }).catch(() => undefined)
       }
     }
-  }, [session, sessionId])
+  }, [apiUrl, session, sessionId])
 
   function updateTerminalField(field: keyof TerminalBlockConfig, nextValue: string) {
     onChange(
@@ -797,6 +1256,15 @@ function TerminalBlock({ blockId, value, session, onChange }: TerminalBlockProps
 function App() {
   const canvasRef = useRef<SVGSVGElement | null>(null)
   const imageInputRef = useRef<HTMLInputElement | null>(null)
+  const [backendConfig, setBackendConfig] = useState<BackendConfig | null>(() => loadStoredBackendConfig())
+  const [isBackendConfigLoading, setIsBackendConfigLoading] = useState(Boolean(window.woxverseDesktop))
+  const [backendModeDraft, setBackendModeDraft] = useState<BackendMode>('remote')
+  const [backendUrlDraft, setBackendUrlDraft] = useState(defaultApiUrl)
+  const [projectsPathDraft, setProjectsPathDraft] = useState('')
+  const [backendConfigMessage, setBackendConfigMessage] = useState('')
+  const [localProjects, setLocalProjects] = useState<LocalProject[]>([])
+  const [localProjectsMessage, setLocalProjectsMessage] = useState('')
+  const [newProjectName, setNewProjectName] = useState('')
   const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>('graph')
   const [loginState, setLoginState] = useState<LoginState>('idle')
   const [saveState, setSaveState] = useState<SaveState>('idle')
@@ -825,6 +1293,7 @@ function App() {
   const [slashMenuBlockId, setSlashMenuBlockId] = useState<string | null>(null)
   const [slashMenuIndex, setSlashMenuIndex] = useState(0)
   const [focusBlockId, setFocusBlockId] = useState<string | null>(null)
+  const apiUrl = normalizeApiUrl(backendConfig?.apiUrl ?? defaultApiUrl)
 
   const selectedNodes = useMemo(
     () => nodes.filter((node) => selectedNodeIds.includes(node.id)),
@@ -839,7 +1308,10 @@ function App() {
     [sectionSearch, sections],
   )
   const filteredSectionCount = useMemo(() => countSections(filteredSections), [filteredSections])
-  const selectedSectionBlocks = selectedSectionId ? docBlocksBySectionId[selectedSectionId] ?? [] : []
+  const selectedSectionBlocks = useMemo(
+    () => (selectedSectionId ? docBlocksBySectionId[selectedSectionId] ?? [] : []),
+    [docBlocksBySectionId, selectedSectionId],
+  )
   const shouldRenderTrailingPlaceholder =
     selectedSectionBlocks.length === 0 ||
     selectedSectionBlocks[selectedSectionBlocks.length - 1]?.type !== 'text' ||
@@ -847,6 +1319,78 @@ function App() {
   const linkedSection = selectedNode
     ? findSection(sections, selectedNode.document_section_id ?? null)
     : null
+
+  useEffect(() => {
+    let isMounted = true
+
+    async function loadDesktopBackendConfig() {
+      if (!window.woxverseDesktop) {
+        setIsBackendConfigLoading(false)
+        return
+      }
+
+      try {
+        const desktopConfig = await window.woxverseDesktop.getBackendConfig()
+
+        if (isMounted && desktopConfig) {
+          const nextConfig = normalizeBackendConfig(desktopConfig)
+          setBackendModeDraft(nextConfig.mode)
+          setBackendUrlDraft(nextConfig.apiUrl)
+          setProjectsPathDraft(nextConfig.projectsPath ?? '')
+          setBackendConfig(nextConfig)
+          if (nextConfig.mode === 'local' && nextConfig.activeProjectPath) {
+            const localSession = { username: 'Local files', token: 'hardcoded-token' }
+            localStorage.setItem(sessionStorageKey, JSON.stringify(localSession))
+            setSession(localSession)
+          }
+        }
+      } catch {
+        if (isMounted) {
+          setBackendConfigMessage('Unable to load backend settings')
+        }
+      } finally {
+        if (isMounted) {
+          setIsBackendConfigLoading(false)
+        }
+      }
+    }
+
+    loadDesktopBackendConfig()
+
+    return () => {
+      isMounted = false
+    }
+  }, [])
+
+  useEffect(() => {
+    let isMounted = true
+
+    async function loadLocalProjects() {
+      if (backendConfig?.mode !== 'local' || !backendConfig.projectsPath || !window.woxverseDesktop) {
+        setLocalProjects([])
+        return
+      }
+
+      try {
+        const projects = await window.woxverseDesktop.listLocalProjects(backendConfig.projectsPath)
+
+        if (isMounted) {
+          setLocalProjects(projects)
+          setLocalProjectsMessage('')
+        }
+      } catch {
+        if (isMounted) {
+          setLocalProjectsMessage('Unable to scan local projects')
+        }
+      }
+    }
+
+    loadLocalProjects()
+
+    return () => {
+      isMounted = false
+    }
+  }, [backendConfig])
 
   function expireSession() {
     localStorage.removeItem(sessionStorageKey)
@@ -888,6 +1432,15 @@ function App() {
 
     async function loadDocument() {
       try {
+        if (backendConfig?.mode === 'local' && backendConfig.activeProjectPath && window.woxverseDesktop) {
+          const document = await window.woxverseDesktop.loadLocalDocument(backendConfig.activeProjectPath)
+          setSections(document.sections)
+          setDocBlocksBySectionId(buildBlocksBySectionId(document.sections))
+          setSelectedSectionId(document.sections[0]?.id ?? null)
+          setDocMessage('Local documentation loaded')
+          return
+        }
+
         const response = await fetch(`${apiUrl}/documents/${documentName}`, {
           headers: {
             Authorization: `Bearer ${session?.token}`,
@@ -915,7 +1468,7 @@ function App() {
 
     loadGraph()
     loadDocument()
-  }, [session])
+  }, [apiUrl, backendConfig, session])
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -936,10 +1489,12 @@ function App() {
       }
 
       if (workspaceMode === 'docs') {
+        // eslint-disable-next-line react-hooks/immutability
         saveDocument()
         return
       }
 
+      // eslint-disable-next-line react-hooks/immutability
       saveGraph()
     }
 
@@ -948,6 +1503,8 @@ function App() {
     return () => {
       window.removeEventListener('keydown', handleKeyDown)
     }
+    // saveDocument and saveGraph close over the same state listed here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [edges, nodes, sections, session, workspaceMode])
 
   useLayoutEffect(() => {
@@ -961,8 +1518,149 @@ function App() {
 
     const editor = document.querySelector<HTMLElement>(`[data-block-id="${focusBlockId}"]`)
     editor?.focus()
-    setFocusBlockId(null)
+    queueMicrotask(() => setFocusBlockId(null))
   }, [focusBlockId, selectedSectionBlocks])
+
+  async function selectProjectsDirectory() {
+    if (!window.woxverseDesktop) {
+      setBackendConfigMessage('Directory selection is available in the desktop app')
+      return
+    }
+
+    const selectedPath = await window.woxverseDesktop.selectProjectsDirectory()
+
+    if (selectedPath) {
+      setProjectsPathDraft(selectedPath)
+      setBackendConfigMessage('')
+    }
+  }
+
+  async function saveBackendSelection(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+
+    const nextConfig = normalizeBackendConfig({
+      mode: backendModeDraft,
+      apiUrl: backendModeDraft === 'remote' ? backendUrlDraft : defaultApiUrl,
+      projectsPath: backendModeDraft === 'local' ? projectsPathDraft : undefined,
+    })
+
+    if (backendModeDraft === 'local' && !nextConfig.projectsPath) {
+      setBackendConfigMessage('Select a local projects directory')
+      return
+    }
+
+    try {
+      let savedConfig = nextConfig
+
+      if (window.woxverseDesktop) {
+        savedConfig = normalizeBackendConfig(await window.woxverseDesktop.saveBackendConfig(nextConfig))
+      } else {
+        localStorage.setItem(backendConfigStorageKey, JSON.stringify(nextConfig))
+      }
+
+      if (backendConfig?.apiUrl !== savedConfig.apiUrl) {
+        localStorage.removeItem(sessionStorageKey)
+        setSession(null)
+      }
+
+      setBackendConfig(savedConfig)
+      if (savedConfig.mode === 'local' && savedConfig.activeProjectPath) {
+        const localSession = { username: 'Local files', token: 'hardcoded-token' }
+        localStorage.setItem(sessionStorageKey, JSON.stringify(localSession))
+        setSession(localSession)
+      }
+      setBackendConfigMessage('')
+    } catch {
+      setBackendConfigMessage(
+        backendModeDraft === 'local'
+          ? 'Unable to start local backend. Check Python and backend dependencies.'
+          : 'Unable to save backend settings',
+      )
+    }
+  }
+
+  function resetBackendSelection() {
+    if (backendConfig) {
+      setBackendModeDraft(backendConfig.mode)
+      setBackendUrlDraft(backendConfig.apiUrl)
+      setProjectsPathDraft(backendConfig.projectsPath ?? '')
+    }
+
+    setBackendConfig(null)
+    setSession(null)
+    localStorage.removeItem(sessionStorageKey)
+  }
+
+  async function openLocalProject(project: LocalProject) {
+    if (!backendConfig || backendConfig.mode !== 'local') {
+      return
+    }
+
+    try {
+      const nextConfig = normalizeBackendConfig({
+        ...backendConfig,
+        activeProjectId: project.id,
+        activeProjectName: project.name,
+        activeProjectPath: project.path,
+      })
+      const savedConfig = window.woxverseDesktop
+        ? normalizeBackendConfig(await window.woxverseDesktop.saveBackendConfig(nextConfig))
+        : nextConfig
+      const localSession = { username: project.name, token: 'hardcoded-token' }
+
+      setBackendConfig(savedConfig)
+      localStorage.setItem(sessionStorageKey, JSON.stringify(localSession))
+      setSession(localSession)
+      setSections([])
+      setDocBlocksBySectionId({})
+      setSelectedSectionId(null)
+      setLocalProjectsMessage('')
+    } catch {
+      setLocalProjectsMessage('Unable to open local project')
+    }
+  }
+
+  async function createAndOpenLocalProject(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+
+    if (!backendConfig?.projectsPath || !window.woxverseDesktop) {
+      setLocalProjectsMessage('Local projects are available in the desktop app')
+      return
+    }
+
+    try {
+      const project = await window.woxverseDesktop.createLocalProject(
+        backendConfig.projectsPath,
+        newProjectName || 'Untitled project',
+      )
+      setNewProjectName('')
+      setLocalProjects((current) => [...current, project].sort((left, right) => left.name.localeCompare(right.name)))
+      await openLocalProject(project)
+    } catch {
+      setLocalProjectsMessage('Unable to create local project')
+    }
+  }
+
+  async function resetLocalProjectSelection() {
+    if (!backendConfig || backendConfig.mode !== 'local') {
+      return
+    }
+
+    const nextConfig = normalizeBackendConfig({
+      ...backendConfig,
+      activeProjectId: undefined,
+      activeProjectName: undefined,
+      activeProjectPath: undefined,
+    })
+
+    if (window.woxverseDesktop) {
+      await window.woxverseDesktop.saveBackendConfig(nextConfig).catch(() => undefined)
+    }
+
+    setBackendConfig(nextConfig)
+    setSession(null)
+    localStorage.removeItem(sessionStorageKey)
+  }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -1328,6 +2026,7 @@ function App() {
       code: '',
       playground: "print('Hello from playground')",
       terminal: stringifyTerminalBlockConfig(createDefaultTerminalConfig()),
+      diagram: stringifyDiagramData(createDefaultDiagramData()),
       quote: '',
     }
 
@@ -1812,17 +2511,32 @@ function App() {
       return false
     }
 
+    const normalizedSectionsToSave = applyBlocksToSections(sectionsToSave, docBlocksBySectionId)
+
     setDocSaveState('loading')
     setDocMessage('')
 
+    const abortController = new AbortController()
+    const timeoutId = window.setTimeout(() => abortController.abort(), 20000)
+
     try {
+      if (backendConfig?.mode === 'local' && backendConfig.activeProjectPath && window.woxverseDesktop) {
+        await window.woxverseDesktop.saveLocalDocument(backendConfig.activeProjectPath, {
+          sections: normalizedSectionsToSave,
+        })
+        setDocSaveState('success')
+        setDocMessage('Local documentation saved')
+        return true
+      }
+
       const response = await fetch(`${apiUrl}/documents/${documentName}`, {
         method: 'PUT',
         headers: {
           Authorization: `Bearer ${session.token}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ sections: sectionsToSave }),
+        signal: abortController.signal,
+        body: JSON.stringify({ sections: normalizedSectionsToSave }),
       })
 
       if (!response.ok) {
@@ -1832,10 +2546,12 @@ function App() {
       setDocSaveState('success')
       setDocMessage('Documentation saved')
       return true
-    } catch {
+    } catch (error) {
       setDocSaveState('error')
-      setDocMessage('Save failed')
+      setDocMessage(error instanceof Error ? error.message : 'Save failed')
       return false
+    } finally {
+      window.clearTimeout(timeoutId)
     }
   }
 
@@ -1861,10 +2577,23 @@ function App() {
       return
     }
 
-    const formData = new FormData()
-    formData.append('file', file)
-
     try {
+      if (backendConfig?.mode === 'local' && backendConfig.activeProjectPath && window.woxverseDesktop) {
+        const upload = await window.woxverseDesktop.saveLocalDocumentAsset(
+          backendConfig.activeProjectPath,
+          selectedSectionId,
+          file.name,
+          await file.arrayBuffer(),
+        )
+        updateContentBlock(blockId, upload.relative_path)
+        setDocSaveState('success')
+        setDocMessage('Image saved')
+        return
+      }
+
+      const formData = new FormData()
+      formData.append('file', file)
+
       const response = await fetch(
         `${apiUrl}/documents/${documentName}/sections/${selectedSectionId}/assets`,
         {
@@ -1997,6 +2726,144 @@ function App() {
     ))
   }
 
+  if (isBackendConfigLoading) {
+    return (
+      <main className="page-shell">
+        <section className="auth-panel" aria-labelledby="backend-loading-title">
+          <div className="auth-header">
+            <h1 id="backend-loading-title">Woxverse</h1>
+          </div>
+          <p className="profile-label">Loading backend settings...</p>
+        </section>
+      </main>
+    )
+  }
+
+  if (!backendConfig) {
+    return (
+      <main className="page-shell">
+        <section className="auth-panel backend-panel" aria-labelledby="backend-title">
+          <div className="auth-header">
+            <h1 id="backend-title">Backend</h1>
+          </div>
+
+          <form className="login-form" onSubmit={saveBackendSelection}>
+            <div className="backend-mode-tabs" role="tablist" aria-label="Backend location">
+              <button
+                className={backendModeDraft === 'remote' ? 'active' : ''}
+                type="button"
+                onClick={() => setBackendModeDraft('remote')}
+              >
+                Remote server
+              </button>
+              <button
+                className={backendModeDraft === 'local' ? 'active' : ''}
+                type="button"
+                onClick={() => setBackendModeDraft('local')}
+              >
+                Local directory
+              </button>
+            </div>
+
+            {backendModeDraft === 'remote' ? (
+              <label htmlFor="backend-url">
+                Backend URL
+                <input
+                  id="backend-url"
+                  type="url"
+                  value={backendUrlDraft}
+                  placeholder="https://api.example.com"
+                  required
+                  onChange={(event) => setBackendUrlDraft(event.target.value)}
+                />
+              </label>
+            ) : (
+              <label htmlFor="projects-path">
+                Projects directory
+                <div className="directory-picker">
+                  <input
+                    id="projects-path"
+                    type="text"
+                    value={projectsPathDraft}
+                    placeholder="Select folder"
+                    readOnly
+                    required
+                  />
+                  <button type="button" onClick={selectProjectsDirectory}>
+                    Browse
+                  </button>
+                </div>
+              </label>
+            )}
+
+            {backendConfigMessage && (
+              <p className="status-message error" role="status">
+                {backendConfigMessage}
+              </p>
+            )}
+
+            <button type="submit">Continue</button>
+          </form>
+        </section>
+      </main>
+    )
+  }
+
+  if (backendConfig.mode === 'local' && !backendConfig.activeProjectPath) {
+    return (
+      <main className="page-shell">
+        <section className="auth-panel backend-panel" aria-labelledby="project-title">
+          <div className="auth-header">
+            <h1 id="project-title">Project</h1>
+            <p className="profile-label">{backendConfig.projectsPath}</p>
+          </div>
+
+          <div className="local-project-list">
+            {localProjects.length > 0 ? (
+              localProjects.map((project) => (
+                <button
+                  className="local-project-button"
+                  type="button"
+                  key={project.path}
+                  onClick={() => openLocalProject(project)}
+                >
+                  <span>{project.name}</span>
+                  <small>{project.path}</small>
+                </button>
+              ))
+            ) : (
+              <p className="profile-label">No projects yet</p>
+            )}
+          </div>
+
+          <form className="login-form" onSubmit={createAndOpenLocalProject}>
+            <label htmlFor="new-project-name">
+              New project
+              <input
+                id="new-project-name"
+                type="text"
+                value={newProjectName}
+                placeholder="Project name"
+                onChange={(event) => setNewProjectName(event.target.value)}
+              />
+            </label>
+
+            {localProjectsMessage && (
+              <p className="status-message error" role="status">
+                {localProjectsMessage}
+              </p>
+            )}
+
+            <button type="submit">Create project</button>
+            <button className="secondary-button" type="button" onClick={resetBackendSelection}>
+              Change projects folder
+            </button>
+          </form>
+        </section>
+      </main>
+    )
+  }
+
   if (session) {
     return (
       <main className="workspace-shell">
@@ -2007,10 +2874,22 @@ function App() {
                 <span className="status-dot" aria-hidden="true" />
                 <h1 id="dashboard-title">Workspace</h1>
               </div>
-              <p className="profile-label">Signed in as {session.username}</p>
+              <p className="profile-label">
+                {backendConfig.mode === 'local'
+                  ? backendConfig.activeProjectName || session.username
+                  : `Signed in as ${session.username}`}
+              </p>
             </div>
             <button className="secondary-button small-button" type="button" onClick={handleSignOut}>
               Sign out
+            </button>
+            {backendConfig.mode === 'local' && (
+              <button className="secondary-button small-button" type="button" onClick={resetLocalProjectSelection}>
+                Projects
+              </button>
+            )}
+            <button className="secondary-button small-button" type="button" onClick={resetBackendSelection}>
+              Backend
             </button>
           </header>
 
@@ -2341,7 +3220,7 @@ function App() {
                                       {block.value && (
                                         <img
                                           className="image-preview"
-                                          src={getImagePreviewUrl(documentName, selectedSectionId, block.value)}
+                                          src={getImagePreviewUrl(apiUrl, documentName, selectedSectionId, block.value)}
                                           alt=""
                                         />
                                       )}
@@ -2437,8 +3316,16 @@ function App() {
                                     </div>
                                   )}
 
+                                  {block.type === 'diagram' && (
+                                    <DiagramBlock
+                                      value={block.value}
+                                      onChange={(nextValue) => updateContentBlock(block.id, nextValue)}
+                                    />
+                                  )}
+
                                   {block.type === 'terminal' && (
                                     <TerminalBlock
+                                      apiUrl={apiUrl}
                                       blockId={block.id}
                                       value={block.value}
                                       session={session}
@@ -2527,6 +3414,9 @@ function App() {
       <section className="auth-panel" aria-labelledby="login-title">
         <div className="auth-header">
           <h1 id="login-title">Sign in</h1>
+          <p className="profile-label">
+            {backendConfig.mode === 'remote' ? backendConfig.apiUrl : backendConfig.projectsPath}
+          </p>
         </div>
 
         <form className="login-form" onSubmit={handleSubmit}>
@@ -2569,6 +3459,9 @@ function App() {
 
           <button type="submit" disabled={loginState === 'loading'}>
             {loginState === 'loading' ? 'Signing in...' : 'Continue'}
+          </button>
+          <button className="secondary-button" type="button" onClick={resetBackendSelection}>
+            Change backend
           </button>
         </form>
       </section>
